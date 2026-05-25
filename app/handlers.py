@@ -57,7 +57,7 @@ class SimpleTTLCache:
 
 def _format_match_line(code: str, name: str, price: float) -> str:
     price_str = f"{price:.2f}"
-    return f"Код: {code} — {name} — {price_str} грн"
+    return f"{code} — {name} — {price_str} грн"
 
 
 async def _download_document_to_path(message: Message, destination: Path) -> None:
