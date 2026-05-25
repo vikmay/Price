@@ -17,6 +17,7 @@ build/
 .eggs/
 .venv/
 venv/
+tmp/
 
 # --- SQLite / DB files ---
 data/*.db
