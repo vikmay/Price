@@ -1,0 +1,31 @@
+# --- Environment ---
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.venv/
+venv/
+
+# --- SQLite / DB files ---
+data/*.db
+*.db
+
+# --- Logs ---
+*.log
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
