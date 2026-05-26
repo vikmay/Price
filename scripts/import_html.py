@@ -39,7 +39,8 @@ CURRENCY_MARKERS_RE = re.compile(r"(UAH|₴)", re.IGNORECASE)
 class ParsedProduct:
     code: str
     name: str
-    price: float
+    retail_price: float
+    purchase_price: float | None
 
 
 def setup_logging() -> None:
@@ -108,46 +109,56 @@ def _parse_price(text: str, *, allow_small_without_currency: bool) -> float | No
         return None
 
 
-def _find_catalog_column_indexes(soup: BeautifulSoup) -> tuple[int, int | None, int] | None:
+def _find_catalog_column_indexes(
+    soup: BeautifulSoup,
+) -> tuple[int, int | None, int, int | None] | None:
     """
     Detect the specific catalog table layout:
-      - Code / Код
+      - Code / Код (optional)
       - Название товара / Назва товару
-      - В розницу / В розн...
+      - В розницу / В розн... (retail)
+      - ЦенаЗакуп (purchase/wholesale) (optional)
 
-    Returns: (name_col_index, code_col_index_or_none, price_col_index)
-    Preference for price column: "В розницу" (retail).
+    Returns:
+      (name_col_index, code_col_index_or_none, retail_price_col_index, purchase_price_col_index_or_none)
     """
     for tr in soup.find_all("tr"):
         cells = tr.find_all(["td", "th"])
         if not cells:
             continue
+
         cell_texts = [c.get_text(" ", strip=True) for c in cells]
         joined = " ".join(cell_texts).lower()
 
         has_name = ("назва" in joined) or ("название товара" in joined) or ("название" in joined)
-        has_price = ("в розницу" in joined) or ("в розн" in joined) or ("в розн" in joined)
-        has_code = ("код" in joined) or ("code" in joined)
-
-        if not (has_name and has_price):
+        has_retail_price = ("в розницу" in joined) or ("в розн" in joined)
+        if not (has_name and has_retail_price):
             continue
 
-        # Find indices by header names.
         name_idx: int | None = None
         code_idx: int | None = None
-        price_idx: int | None = None
+        retail_price_idx: int | None = None
+        purchase_price_idx: int | None = None
 
         for i, t in enumerate(cell_texts):
-            tl = t.lower()
-            if name_idx is None and ("название товара" in tl or tl == "назва" or "назва" in tl):
+            tl = t.lower().replace(" ", "")
+
+            if name_idx is None and ("названиетовара" in tl or tl == "назва" or "назва" in tl):
                 name_idx = i
             if code_idx is None and ("код" in tl or tl == "code" or "code" in tl):
                 code_idx = i
-            if price_idx is None and ("в розницу" in tl or "в розн" in tl):
-                price_idx = i
 
-        if name_idx is not None and price_idx is not None:
-            return name_idx, code_idx, price_idx
+            # Retail: "В розницу" / "В розн..."
+            # Note: we strip spaces above, so "В розницу" becomes "врозницу".
+            if retail_price_idx is None and ("врозницу" in tl or "врозн" in tl):
+                retail_price_idx = i
+
+            # Purchase: "ЦенаЗакуп" (often comes as single word)
+            if purchase_price_idx is None and ("ценазакуп" in tl or "закуп" in tl or "опт" in tl):
+                purchase_price_idx = i
+
+        if name_idx is not None and retail_price_idx is not None:
+            return name_idx, code_idx, retail_price_idx, purchase_price_idx
 
     return None
 
@@ -156,13 +167,18 @@ def _extract_products_from_table(soup: BeautifulSoup) -> list[ParsedProduct]:
     # First try: detect the exact provided catalog layout and parse directly.
     indexes = _find_catalog_column_indexes(soup)
     if indexes is not None:
-        name_idx, code_idx, price_idx = indexes
+        name_idx, code_idx, retail_price_idx, purchase_price_idx = indexes
         products: list[ParsedProduct] = []
 
         for tr in soup.find_all("tr"):
             cells = tr.find_all(["td", "th"])
 
-            max_idx = max(name_idx, price_idx, code_idx if code_idx is not None else 0)
+            max_idx = max(
+                name_idx,
+                retail_price_idx,
+                code_idx if code_idx is not None else 0,
+                purchase_price_idx if purchase_price_idx is not None else 0,
+            )
             if len(cells) <= max_idx:
                 continue
 
@@ -178,14 +194,31 @@ def _extract_products_from_table(soup: BeautifulSoup) -> list[ParsedProduct]:
             if code_idx is not None and code_idx < len(cells):
                 code_cell = cells[code_idx].get_text(" ", strip=True)
 
-            price_cell = cells[price_idx].get_text(" ", strip=True)
+            retail_price_cell = cells[retail_price_idx].get_text(" ", strip=True)
+
+            purchase_price_cell = None
+            if purchase_price_idx is not None and purchase_price_idx < len(cells):
+                pc = cells[purchase_price_idx].get_text(" ", strip=True)
+                purchase_price_cell = pc if pc else None
 
             name = _normalize_name(name_cell)
-            price = _parse_price(price_cell, allow_small_without_currency=True)
+            retail_price = _parse_price(retail_price_cell, allow_small_without_currency=True)
+
+            purchase_price: float | None = None
+            if purchase_price_cell:
+                purchase_price = _parse_price(purchase_price_cell, allow_small_without_currency=True)
+
             code = code_cell.strip()
 
-            if name and price is not None:
-                products.append(ParsedProduct(code=code, name=name, price=price))
+            if name and retail_price is not None:
+                products.append(
+                    ParsedProduct(
+                        code=code,
+                        name=name,
+                        retail_price=retail_price,
+                        purchase_price=purchase_price,
+                    ),
+                )
 
         return products
 
@@ -221,7 +254,7 @@ def _extract_products_from_table(soup: BeautifulSoup) -> list[ParsedProduct]:
                 break
 
         if name and price is not None:
-            products.append(ParsedProduct(code="", name=name, price=price))
+            products.append(ParsedProduct(code="", name=name, retail_price=price, purchase_price=None))
 
     return products
 
@@ -250,7 +283,9 @@ def _extract_products_from_price_elements(soup: BeautifulSoup) -> list[ParsedPro
 
         name = _normalize_name(name_candidate)
         if name and len(name) >= 2:
-            products.append(ParsedProduct(code="", name=name, price=price))
+            products.append(
+                ParsedProduct(code="", name=name, retail_price=price, purchase_price=None),
+            )
 
     return products
 
@@ -325,7 +360,7 @@ def import_file(file_path: str, db_path: str, *, clear_db: bool = False) -> int:
     inserted = len(parsed)
 
     # Bulk upsert using a single DB executor call (fast for many rows).
-    items = [(p.code, p.name, p.price) for p in parsed]
+    items = [(p.code, p.name, p.retail_price, p.purchase_price) for p in parsed]
 
     import asyncio
 

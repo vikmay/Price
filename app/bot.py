@@ -19,6 +19,24 @@ def setup_logging() -> None:
     )
 
 
+async def _bootstrap_admin_if_needed(products_db: ProductsDB) -> None:
+    """
+    If DB has no admins, create the first admin from ADMIN_TELEGRAM_ID env.
+    Ensures the bot is manageable without manual SQL.
+    """
+    admin_id_raw = os.getenv("ADMIN_TELEGRAM_ID")
+    if not admin_id_raw:
+        return
+
+    try:
+        admin_id = int(str(admin_id_raw).strip())
+    except ValueError:
+        return
+
+    # Always ensure ADMIN_TELEGRAM_ID is admin (if set in env).
+    await products_db.upsert_user_role(user_id=admin_id, role="admin", is_active=True)
+
+
 async def main() -> None:
     setup_logging()
 
@@ -27,6 +45,7 @@ async def main() -> None:
         db_path = os.getenv("DB_PATH", os.path.join("data", "products.db"))
         connect(db_path)
         products_db = ProductsDB(db_path)
+        await _bootstrap_admin_if_needed(products_db)
         register_handlers(products_db)
         logging.info("Bot smoke check OK (BOT_SMOKE=1).")
         return
@@ -39,6 +58,7 @@ async def main() -> None:
     dp = Dispatcher()
 
     products_db = ProductsDB(settings.DB_PATH)
+    await _bootstrap_admin_if_needed(products_db)
     register_handlers(products_db)
 
     dp.include_router(router)

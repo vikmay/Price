@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +15,7 @@ class ProductMatch:
     code: str
     name: str
     price: float
+    purchase_price: float | None
     updated_at: str
 
 
@@ -59,6 +60,7 @@ def connect(db_path: str) -> None:
                 name TEXT NOT NULL,
                 name_cf TEXT NOT NULL,
                 price REAL NOT NULL,
+                purchase_price REAL,
                 updated_at TEXT NOT NULL
             );
             """
@@ -73,6 +75,9 @@ def connect(db_path: str) -> None:
 
         if "name_cf" not in cols:
             conn.execute("ALTER TABLE products ADD COLUMN name_cf TEXT;")
+
+        if "purchase_price" not in cols:
+            conn.execute("ALTER TABLE products ADD COLUMN purchase_price REAL;")
 
         # Backfill missing values.
         conn.execute(
@@ -111,6 +116,31 @@ def connect(db_path: str) -> None:
             """
         )
 
+        # Access control table for bot users (admin/allowed).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_access (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_access_role
+            ON user_access(role);
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_access_role_active
+            ON user_access(role, is_active);
+            """
+        )
+
         conn.commit()
     finally:
         conn.close()
@@ -130,6 +160,22 @@ def _looks_like_code(query: str) -> bool:
     return q.isdigit()
 
 
+def _row_to_match(row: sqlite3.Row) -> ProductMatch:
+    purchase_price: float | None
+    if row["purchase_price"] is None:
+        purchase_price = None
+    else:
+        purchase_price = float(row["purchase_price"])
+
+    return ProductMatch(
+        code=str(row["code"]),
+        name=str(row["name"]),
+        price=float(row["price"]),
+        purchase_price=purchase_price,
+        updated_at=str(row["updated_at"]),
+    )
+
+
 def _search_products_by_code_exact_sync(db_path: str, code: str, limit: int) -> list[ProductMatch]:
     clean_code = _normalize_code(code)
     if not clean_code:
@@ -139,7 +185,7 @@ def _search_products_by_code_exact_sync(db_path: str, code: str, limit: int) -> 
     try:
         cur = conn.execute(
             """
-            SELECT code, name, price, updated_at
+            SELECT code, name, price, purchase_price, updated_at
             FROM products
             WHERE code = ?
             ORDER BY updated_at DESC
@@ -147,17 +193,7 @@ def _search_products_by_code_exact_sync(db_path: str, code: str, limit: int) -> 
             """,
             (clean_code, limit),
         )
-        rows: list[ProductMatch] = []
-        for row in cur.fetchall():
-            rows.append(
-                ProductMatch(
-                    code=str(row["code"]),
-                    name=str(row["name"]),
-                    price=float(row["price"]),
-                    updated_at=str(row["updated_at"]),
-                )
-            )
-        return rows
+        return [_row_to_match(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
@@ -167,7 +203,7 @@ def _search_products_by_price_exact_sync(db_path: str, price: float, limit: int)
     try:
         cur = conn.execute(
             """
-            SELECT code, name, price, updated_at
+            SELECT code, name, price, purchase_price, updated_at
             FROM products
             WHERE price = ?
             ORDER BY updated_at DESC
@@ -175,23 +211,13 @@ def _search_products_by_price_exact_sync(db_path: str, price: float, limit: int)
             """,
             (float(price), limit),
         )
-        rows: list[ProductMatch] = []
-        for row in cur.fetchall():
-            rows.append(
-                ProductMatch(
-                    code=str(row["code"]),
-                    name=str(row["name"]),
-                    price=float(row["price"]),
-                    updated_at=str(row["updated_at"]),
-                )
-            )
-        return rows
+        return [_row_to_match(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
 
 def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> list[ProductMatch]:
-    q = query.strip()
+    q = " ".join((query or "").strip().split())
     if not q:
         return []
 
@@ -199,6 +225,19 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
     prefix_like = f"{q_cf}%"
     substring_like = f"%{q_cf}%"
 
+    tokens = [t for t in q_cf.split() if t]
+    is_single_token = len(tokens) == 1
+
+    NO_MATCH = "§§§§§"
+    if is_single_token:
+        whole_word_prefix_like = f"{q_cf} %"
+        whole_word_middle_like = f"% {q_cf} %"
+        whole_word_suffix_like = f"% {q_cf}"
+    else:
+        whole_word_prefix_like = f"%{NO_MATCH}%"
+        whole_word_middle_like = f"%{NO_MATCH}%"
+        whole_word_suffix_like = f"%{NO_MATCH}%"
+
     conn = _get_conn(db_path)
     try:
         rows: list[ProductMatch] = []
@@ -206,7 +245,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
 
         cur = conn.execute(
             """
-            SELECT code, name, price, updated_at
+            SELECT code, name, price, purchase_price, updated_at
             FROM products
             WHERE name_cf LIKE ?
             ORDER BY
@@ -225,14 +264,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
             if code in existing_codes:
                 continue
             existing_codes.add(code)
-            rows.append(
-                ProductMatch(
-                    code=code,
-                    name=str(row["name"]),
-                    price=float(row["price"]),
-                    updated_at=str(row["updated_at"]),
-                )
-            )
+            rows.append(_row_to_match(row))
 
         if len(rows) < limit:
             remaining = limit - len(rows)
@@ -240,35 +272,83 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
 
             cur2 = conn.execute(
                 """
-                SELECT code, name, price, updated_at
+                SELECT code, name, price, purchase_price, updated_at
                 FROM products
                 WHERE name_cf LIKE ?
                 ORDER BY
                     CASE
                         WHEN name_cf = ? THEN 0
                         WHEN name_cf LIKE ? THEN 1
-                        ELSE 2
+                        WHEN name_cf LIKE ? THEN 1
+                        WHEN name_cf LIKE ? THEN 1
+                        WHEN name_cf LIKE ? THEN 2
+                        ELSE 3
                     END,
                     name_cf
                 LIMIT ?;
                 """,
-                (substring_like, q_cf, prefix_like, extra),
+                (
+                    substring_like,
+                    q_cf,
+                    whole_word_prefix_like,
+                    whole_word_middle_like,
+                    whole_word_suffix_like,
+                    prefix_like,
+                    extra,
+                ),
             )
             for row in cur2.fetchall():
                 code = str(row["code"])
                 if code in existing_codes:
                     continue
                 existing_codes.add(code)
-                rows.append(
-                    ProductMatch(
-                        code=code,
-                        name=str(row["name"]),
-                        price=float(row["price"]),
-                        updated_at=str(row["updated_at"]),
-                    )
-                )
+                rows.append(_row_to_match(row))
                 if len(rows) >= limit:
                     break
+
+        if not rows:
+            tokens = [t for t in q_cf.split() if t]
+            if len(tokens) >= 2:
+                params = [f"%{t}%" for t in tokens]
+
+                where_and = " AND ".join(["name_cf LIKE ?"] * len(tokens))
+                cur3 = conn.execute(
+                    f"""
+                    SELECT code, name, price, purchase_price, updated_at
+                    FROM products
+                    WHERE {where_and}
+                    LIMIT ?;
+                    """,
+                    (*params, limit),
+                )
+                for row in cur3.fetchall():
+                    code = str(row["code"])
+                    if code in existing_codes:
+                        continue
+                    existing_codes.add(code)
+                    rows.append(_row_to_match(row))
+                    if len(rows) >= limit:
+                        break
+
+                if not rows:
+                    where_or = " OR ".join(["name_cf LIKE ?"] * len(tokens))
+                    cur4 = conn.execute(
+                        f"""
+                        SELECT code, name, price, purchase_price, updated_at
+                        FROM products
+                        WHERE {where_or}
+                        LIMIT ?;
+                        """,
+                        (*params, limit),
+                    )
+                    for row in cur4.fetchall():
+                        code = str(row["code"])
+                        if code in existing_codes:
+                            continue
+                        existing_codes.add(code)
+                        rows.append(_row_to_match(row))
+                        if len(rows) >= limit:
+                            break
 
         return rows
     finally:
@@ -276,17 +356,20 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
 
 
 def _search_products_sync(db_path: str, query: str, limit: int) -> list[ProductMatch]:
+    """
+    Combined search (code exact if possible, then name search).
+    Not used in handlers currently, but kept consistent.
+    """
     q = query.strip()
     if not q:
         return []
 
     conn = _get_conn(db_path)
     try:
-        # 1) Exact match by code (digits-only) if it looks like a code.
         if _looks_like_code(q):
             cur = conn.execute(
                 """
-                SELECT code, name, price, updated_at
+                SELECT code, name, price, purchase_price, updated_at
                 FROM products
                 WHERE code = ?
                 ORDER BY updated_at DESC
@@ -294,31 +377,20 @@ def _search_products_sync(db_path: str, query: str, limit: int) -> list[ProductM
                 """,
                 (q, limit),
             )
-            rows: list[ProductMatch] = []
-            for row in cur.fetchall():
-                rows.append(
-                    ProductMatch(
-                        code=str(row["code"]),
-                        name=str(row["name"]),
-                        price=float(row["price"]),
-                        updated_at=str(row["updated_at"]),
-                    )
-                )
+            rows = [_row_to_match(row) for row in cur.fetchall()]
             if rows:
                 return rows
-            # If no code matches, fall through to name search.
 
-        # 2) Case-insensitive name search (prefix first, then substring).
         q_cf = _casefold_str(q)
         prefix_like = f"{q_cf}%"
         substring_like = f"%{q_cf}%"
 
-        rows = []
+        rows: list[ProductMatch] = []
         existing_codes: set[str] = set()
 
         cur = conn.execute(
             """
-            SELECT code, name, price, updated_at
+            SELECT code, name, price, purchase_price, updated_at
             FROM products
             WHERE name_cf LIKE ?
             ORDER BY
@@ -337,23 +409,15 @@ def _search_products_sync(db_path: str, query: str, limit: int) -> list[ProductM
             if code in existing_codes:
                 continue
             existing_codes.add(code)
-            rows.append(
-                ProductMatch(
-                    code=code,
-                    name=str(row["name"]),
-                    price=float(row["price"]),
-                    updated_at=str(row["updated_at"]),
-                )
-            )
+            rows.append(_row_to_match(row))
 
-        # Fallback: substring search only if we didn't fill the list.
         if len(rows) < limit:
             remaining = limit - len(rows)
             extra = remaining * 5
 
             cur2 = conn.execute(
                 """
-                SELECT code, name, price, updated_at
+                SELECT code, name, price, purchase_price, updated_at
                 FROM products
                 WHERE name_cf LIKE ?
                 ORDER BY
@@ -372,14 +436,7 @@ def _search_products_sync(db_path: str, query: str, limit: int) -> list[ProductM
                 if code in existing_codes:
                     continue
                 existing_codes.add(code)
-                rows.append(
-                    ProductMatch(
-                        code=code,
-                        name=str(row["name"]),
-                        price=float(row["price"]),
-                        updated_at=str(row["updated_at"]),
-                    )
-                )
+                rows.append(_row_to_match(row))
                 if len(rows) >= limit:
                     break
 
@@ -393,6 +450,7 @@ def _insert_or_update_product_sync(
     code: str,
     name: str,
     price: float,
+    purchase_price: float | None,
     updated_at: str,
 ) -> None:
     clean_name = " ".join((name or "").split())
@@ -406,26 +464,33 @@ def _insert_or_update_product_sync(
     try:
         conn.execute("BEGIN IMMEDIATE;")
 
-        # Prefer upsert by code if present; fallback to name_cf.
         if clean_code:
             cur = conn.execute("SELECT id FROM products WHERE code = ? LIMIT 1;", (clean_code,))
             row = cur.fetchone()
             if row is None:
                 conn.execute(
                     """
-                    INSERT INTO products (code, name, name_cf, price, updated_at)
-                    VALUES (?, ?, ?, ?, ?);
+                    INSERT INTO products (code, name, name_cf, price, purchase_price, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?);
                     """,
-                    (clean_code, clean_name, clean_name_cf, price, updated_at),
+                    (clean_code, clean_name, clean_name_cf, float(price), purchase_price, updated_at),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE products
-                    SET code = ?, name = ?, name_cf = ?, price = ?, updated_at = ?
+                    SET code = ?, name = ?, name_cf = ?, price = ?, purchase_price = ?, updated_at = ?
                     WHERE id = ?;
                     """,
-                    (clean_code, clean_name, clean_name_cf, price, updated_at, int(row["id"])),
+                    (
+                        clean_code,
+                        clean_name,
+                        clean_name_cf,
+                        float(price),
+                        purchase_price,
+                        updated_at,
+                        int(row["id"]),
+                    ),
                 )
         else:
             cur = conn.execute("SELECT id FROM products WHERE name_cf = ? LIMIT 1;", (clean_name_cf,))
@@ -433,19 +498,26 @@ def _insert_or_update_product_sync(
             if row is None:
                 conn.execute(
                     """
-                    INSERT INTO products (code, name, name_cf, price, updated_at)
-                    VALUES (?, ?, ?, ?, ?);
+                    INSERT INTO products (code, name, name_cf, price, purchase_price, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?);
                     """,
-                    ("", clean_name, clean_name_cf, price, updated_at),
+                    ("", clean_name, clean_name_cf, float(price), purchase_price, updated_at),
                 )
             else:
                 conn.execute(
                     """
                     UPDATE products
-                    SET name = ?, name_cf = ?, price = ?, updated_at = ?
+                    SET name = ?, name_cf = ?, price = ?, purchase_price = ?, updated_at = ?
                     WHERE id = ?;
                     """,
-                    (clean_name, clean_name_cf, price, updated_at, int(row["id"])),
+                    (
+                        clean_name,
+                        clean_name_cf,
+                        float(price),
+                        purchase_price,
+                        updated_at,
+                        int(row["id"]),
+                    ),
                 )
 
         conn.commit()
@@ -458,11 +530,11 @@ def _insert_or_update_product_sync(
 
 def _insert_or_update_products_sync(
     db_path: str,
-    items: list[tuple[str, str, float]],
+    items: list[tuple[str, str, float, float | None]],
     updated_at: str,
 ) -> None:
     """
-    items: list of (code, name, price)
+    items: list of (code, name, retail_price, purchase_price)
     """
     if not items:
         return
@@ -475,21 +547,21 @@ def _insert_or_update_products_sync(
         select_id_by_name_cf = conn.execute
 
         insert_sql = """
-            INSERT INTO products (code, name, name_cf, price, updated_at)
-            VALUES (?, ?, ?, ?, ?);
+            INSERT INTO products (code, name, name_cf, price, purchase_price, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?);
         """
         update_sql_by_code = """
             UPDATE products
-            SET code = ?, name = ?, name_cf = ?, price = ?, updated_at = ?
+            SET code = ?, name = ?, name_cf = ?, price = ?, purchase_price = ?, updated_at = ?
             WHERE id = ?;
         """
         update_sql_by_name_cf = """
             UPDATE products
-            SET name = ?, name_cf = ?, price = ?, updated_at = ?
+            SET name = ?, name_cf = ?, price = ?, purchase_price = ?, updated_at = ?
             WHERE id = ?;
         """
 
-        for code, name, price in items:
+        for code, name, retail_price, purchase_price in items:
             clean_name = " ".join((name or "").split())
             if not clean_name:
                 continue
@@ -501,7 +573,17 @@ def _insert_or_update_products_sync(
                 cur = select_id_by_code("SELECT id FROM products WHERE code = ? LIMIT 1;", (clean_code,))
                 row = cur.fetchone()
                 if row is None:
-                    conn.execute(insert_sql, (clean_code, clean_name, clean_name_cf, float(price), updated_at))
+                    conn.execute(
+                        insert_sql,
+                        (
+                            clean_code,
+                            clean_name,
+                            clean_name_cf,
+                            float(retail_price),
+                            purchase_price,
+                            updated_at,
+                        ),
+                    )
                 else:
                     conn.execute(
                         update_sql_by_code,
@@ -509,7 +591,8 @@ def _insert_or_update_products_sync(
                             clean_code,
                             clean_name,
                             clean_name_cf,
-                            float(price),
+                            float(retail_price),
+                            purchase_price,
                             updated_at,
                             int(row["id"]),
                         ),
@@ -521,11 +604,28 @@ def _insert_or_update_products_sync(
                 )
                 row = cur.fetchone()
                 if row is None:
-                    conn.execute(insert_sql, ("", clean_name, clean_name_cf, float(price), updated_at))
+                    conn.execute(
+                        insert_sql,
+                        (
+                            "",
+                            clean_name,
+                            clean_name_cf,
+                            float(retail_price),
+                            purchase_price,
+                            updated_at,
+                        ),
+                    )
                 else:
                     conn.execute(
                         update_sql_by_name_cf,
-                        (clean_name, clean_name_cf, float(price), updated_at, int(row["id"])),
+                        (
+                            clean_name,
+                            clean_name_cf,
+                            float(retail_price),
+                            purchase_price,
+                            updated_at,
+                            int(row["id"]),
+                        ),
                     )
 
         conn.commit()
@@ -559,13 +659,7 @@ class ProductsDB:
         limit: int = DEFAULT_LIMIT,
     ) -> list[ProductMatch]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            _search_products_by_name_only_sync,
-            self._db_path,
-            query,
-            limit,
-        )
+        return await loop.run_in_executor(None, _search_products_by_name_only_sync, self._db_path, query, limit)
 
     async def search_products_by_code_exact(
         self,
@@ -573,13 +667,7 @@ class ProductsDB:
         limit: int = DEFAULT_LIMIT,
     ) -> list[ProductMatch]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            _search_products_by_code_exact_sync,
-            self._db_path,
-            code,
-            limit,
-        )
+        return await loop.run_in_executor(None, _search_products_by_code_exact_sync, self._db_path, code, limit)
 
     async def search_products_by_price_exact(
         self,
@@ -587,19 +675,14 @@ class ProductsDB:
         limit: int = DEFAULT_LIMIT,
     ) -> list[ProductMatch]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            _search_products_by_price_exact_sync,
-            self._db_path,
-            price,
-            limit,
-        )
+        return await loop.run_in_executor(None, _search_products_by_price_exact_sync, self._db_path, price, limit)
 
     async def insert_or_update_product(
         self,
         code: str,
         name: str,
         price: float,
+        purchase_price: float | None = None,
         updated_at: str | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
@@ -611,12 +694,13 @@ class ProductsDB:
             code,
             name,
             float(price),
+            purchase_price,
             ts,
         )
 
     async def insert_or_update_products(
         self,
-        items: list[tuple[str, str, float]],
+        items: list[tuple[str, str, float, float | None]],
         updated_at: str | None = None,
     ) -> None:
         if not items:
@@ -625,7 +709,148 @@ class ProductsDB:
         ts = updated_at if updated_at is not None else _utc_now_iso()
         await loop.run_in_executor(None, _insert_or_update_products_sync, self._db_path, items, ts)
 
+    async def get_user_role(self, user_id: int) -> str | None:
+        """
+        Returns role for user if present, else None.
+        Role can be: "admin" or "allowed".
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get_user_role_sync, self._db_path, int(user_id))
 
-# Convenience for scripts that don't want the class:
+    async def is_user_active(self, user_id: int) -> bool:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _is_user_active_sync, self._db_path, int(user_id))
+
+    async def upsert_user_role(self, user_id: int, role: str, is_active: bool = True) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _upsert_user_role_sync,
+            self._db_path,
+            int(user_id),
+            str(role),
+            1 if is_active else 0,
+            _utc_now_iso(),
+        )
+
+    async def set_user_active(self, user_id: int, is_active: bool) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            _set_user_active_sync,
+            self._db_path,
+            int(user_id),
+            1 if is_active else 0,
+            _utc_now_iso(),
+        )
+
+    async def delete_user_access(self, user_id: int) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _delete_user_access_sync, self._db_path, int(user_id))
+
+    async def any_admin_exists(self) -> bool:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _any_admin_exists_sync, self._db_path)
+
+    async def list_users_by_role(self, role: str) -> list[int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _list_users_by_role_sync, self._db_path, str(role))
+
+
+def _get_user_role_sync(db_path: str, user_id: int) -> str | None:
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute("SELECT role FROM user_access WHERE user_id = ? LIMIT 1;", (user_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        role = row["role"]
+        return str(role) if role is not None else None
+    finally:
+        conn.close()
+
+
+def _is_user_active_sync(db_path: str, user_id: int) -> bool:
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT is_active FROM user_access WHERE user_id = ? LIMIT 1;",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        return int(row["is_active"]) == 1
+    finally:
+        conn.close()
+
+
+def _upsert_user_role_sync(db_path: str, user_id: int, role: str, is_active: int, updated_at: str) -> None:
+    conn = _get_conn(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO user_access (user_id, role, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                role = excluded.role,
+                is_active = excluded.is_active,
+                updated_at = excluded.updated_at;
+            """,
+            (user_id, role, is_active, updated_at, updated_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_user_active_sync(db_path: str, user_id: int, is_active: int, updated_at: str) -> None:
+    conn = _get_conn(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE user_access
+            SET is_active = ?, updated_at = ?
+            WHERE user_id = ?;
+            """,
+            (is_active, updated_at, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_user_access_sync(db_path: str, user_id: int) -> None:
+    conn = _get_conn(db_path)
+    try:
+        conn.execute("DELETE FROM user_access WHERE user_id = ?;", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _any_admin_exists_sync(db_path: str) -> bool:
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute("SELECT 1 FROM user_access WHERE role = ? AND is_active = 1 LIMIT 1;", ("admin",))
+        row = cur.fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _list_users_by_role_sync(db_path: str, role: str) -> list[int]:
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT user_id FROM user_access WHERE role = ? AND is_active = 1 ORDER BY user_id ASC;",
+            (role,),
+        )
+        return [int(r["user_id"]) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def utc_now_iso() -> str:
     return _utc_now_iso()

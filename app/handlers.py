@@ -55,9 +55,22 @@ class SimpleTTLCache:
         self._items.clear()
 
 
-def _format_match_line(code: str, name: str, price: float) -> str:
-    price_str = f"{price:.2f}"
-    return f"{code} — {name} — {price_str} грн"
+def _format_match_line(code: str, name: str, retail_price: float) -> str:
+    retail_str = f"{retail_price:.2f}"
+    return f"{code} — {name} — {retail_str}"
+
+
+def _format_match_line_admin(
+    code: str,
+    name: str,
+    retail_price: float,
+    purchase_price: float | None,
+) -> str:
+    retail_str = f"{retail_price:.2f}"
+    if purchase_price is None:
+        return f"{code} — {name} — {retail_str}"
+    purchase_str = f"{purchase_price:.2f}"
+    return f"{code} — {name} — {retail_str}({purchase_str})"
 
 
 async def _download_document_to_path(message: Message, destination: Path) -> None:
@@ -159,9 +172,37 @@ def register_handlers(products_db: ProductsDB) -> None:
         )
 
     user_mode: dict[int, str] = {}
+    effective_admin: dict[int, bool] = {}
 
-    def _cache_key(mode: str, query: str) -> str:
-        return f"{mode}:{query}"
+    async def _get_access_role_tag(uid: int) -> str | None:
+        role = await products_db.get_user_role(uid)
+        if role is None:
+            return None
+        if not await products_db.is_user_active(uid):
+            return None
+
+        role_str = str(role).lower()
+        if role_str in ("admin", "allowed"):
+            return role_str
+        return None
+
+    async def _require_allowed(message: Message) -> bool:
+        role_tag = await _get_access_role_tag(message.from_user.id)
+        if role_tag is None:
+            await message.answer("Доступ заборонено")
+            return False
+        return True
+
+    async def _require_admin(message: Message) -> bool:
+        role_tag = await _get_access_role_tag(message.from_user.id)
+        if role_tag != "admin":
+            await message.answer("Доступ заборонено")
+            return False
+        return True
+
+    def _cache_key(mode: str, query: str, is_admin: bool) -> str:
+        role = "admin" if is_admin else "user"
+        return f"{role}:{mode}:{query}"
 
     async def _send_main_hint(message: Message, active_mode: str) -> None:
         kb = _make_keyboard(active_mode)
@@ -177,14 +218,200 @@ def register_handlers(products_db: ProductsDB) -> None:
         kb = _make_keyboard(active_mode)
         await message.answer("Товар не знайдено", reply_markup=kb)
 
+    def _extract_target_user_id(message: Message) -> int | None:
+        """
+        Supports:
+          - /grant 123
+          - /grant (as reply to user's message)
+        """
+        if message.reply_to_message and message.reply_to_message.from_user:
+            return int(message.reply_to_message.from_user.id)
+
+        text = message.text or ""
+        parts = text.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            return None
+
+        try:
+            return int(parts[1].strip())
+        except ValueError:
+            return None
+
+    async def _require_admin_or_reply(message: Message) -> bool:
+        return await _require_admin(message)
+
+    def _role_line(role_tag: str | None) -> str:
+        if role_tag is None:
+            return "нема доступу"
+        if role_tag == "admin":
+            return "admin"
+        if role_tag == "allowed":
+            return "allowed"
+        return str(role_tag)
+
+    async def _who_role(message: Message) -> str:
+        uid = message.from_user.id
+        role_tag = await _get_access_role_tag(uid)
+        return _role_line(role_tag)
+
+    @router.message(Command("whoami"))
+    async def _whoami(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        role_tag = await _get_access_role_tag(message.from_user.id)
+        await message.answer(f"Ваш статус: {_role_line(role_tag)}")
+
+    @router.message(Command("help"))
+    async def _help(message: Message) -> None:
+        uid = message.from_user.id
+        role_tag = await _get_access_role_tag(uid)
+        if role_tag is None:
+            await message.answer("Доступ заборонено")
+            return
+
+        base_lines = [
+            "Команди:",
+            "/start — початок",
+            "/help — ця підказка",
+            "",
+            "Пошук:",
+            "Просто введіть текст: Код / Назва / Ціна (через кнопки).",
+            "",
+        ]
+
+        if role_tag == "admin":
+            admin_lines = [
+                "Керування доступом (admin):",
+                "/admins — список admin",
+                "/allowed — список allowed",
+                "/whoami — ваш статус",
+                "",
+                "/grant <user_id> — додати в allowed",
+                "/revoke <user_id> — вимкнути доступ (is_active=0)",
+                "/grant_admin <user_id> — зробити admin",
+                "/revoke_admin <user_id> — вимкнути (admin знято)",
+                "",
+                "Адмін-перемикач видимості (щоб працювати як user):",
+                "/as_user — показувати відповідь як user (без purchase_price)",
+                "/as_admin — повернути admin-видимість",
+                "",
+                "Адміністраторські дії:",
+                "/reload — очистити кеш",
+            ]
+            await message.answer("\n".join(base_lines + admin_lines))
+            return
+
+        # allowed
+        await message.answer(
+            "\n".join(
+                base_lines
+                + [
+                    "Ви: allowed",
+                    "",
+                    "Доступні тільки для admin:",
+                    "/reload",
+                    "/grant /revoke /grant_admin /revoke_admin",
+                    "/admins /allowed /whoami",
+                ],
+            )
+        )
+
+    @router.message(Command("as_user"))
+    async def _as_user(message: Message) -> None:
+        if not await _require_admin(message):
+            return
+        uid = message.from_user.id
+        effective_admin[uid] = False
+        await message.answer("Готово. Відповіді будуть як у user (без purchase_price).")
+
+    @router.message(Command("as_admin"))
+    async def _as_admin(message: Message) -> None:
+        if not await _require_admin(message):
+            return
+        uid = message.from_user.id
+        effective_admin[uid] = True
+        await message.answer("Готово. Відповіді будуть як у admin (з purchase_price).")
+
+    @router.message(Command("admins"))
+    async def _admins(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        ids = await products_db.list_users_by_role("admin")
+        if not ids:
+            await message.answer("Адмінів нема.")
+            return
+        await message.answer("Адміни: " + ", ".join(str(i) for i in ids))
+
+    @router.message(Command("allowed"))
+    async def _allowed(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        ids = await products_db.list_users_by_role("allowed")
+        if not ids:
+            await message.answer("Allowed нема.")
+            return
+        await message.answer("Allowed: " + ", ".join(str(i) for i in ids))
+
+    @router.message(Command("grant"))
+    async def _grant_allowed(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        target_id = _extract_target_user_id(message)
+        if target_id is None:
+            await message.answer("Вкажіть user_id або відповісте на повідомлення користувача. Напр: /grant 123456")
+            return
+        await products_db.upsert_user_role(user_id=target_id, role="allowed", is_active=True)
+        await message.answer(f"OK: user {target_id} додано в allowed.")
+
+    @router.message(Command("revoke"))
+    async def _revoke_user(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        target_id = _extract_target_user_id(message)
+        if target_id is None:
+            await message.answer("Вкажіть user_id або відповісте на повідомлення користувача. Напр: /revoke 123456")
+            return
+        await products_db.set_user_active(user_id=target_id, is_active=False)
+        await message.answer(f"OK: user {target_id} відключено (is_active=0).")
+
+    @router.message(Command("grant_admin"))
+    async def _grant_admin(message: Message) -> None:
+        if not await _require_admin_or_reply(message):
+            return
+        target_id = _extract_target_user_id(message)
+        if target_id is None:
+            await message.answer("Вкажіть user_id або відповісте на повідомлення користувача. Напр: /grant_admin 123456")
+            return
+        await products_db.upsert_user_role(user_id=target_id, role="admin", is_active=True)
+        await message.answer(f"OK: user {target_id} зроблено admin.")
+
+    @router.message(Command("revoke_admin"))
+    async def _revoke_admin(message: Message) -> None:
+        """
+        Безпечний варіант: вимикає доступ повністю (не переводить автоматично в allowed).
+        """
+        if not await _require_admin_or_reply(message):
+            return
+        target_id = _extract_target_user_id(message)
+        if target_id is None:
+            await message.answer("Вкажіть user_id або відповісте на повідомлення користувача. Напр: /revoke_admin 123456")
+            return
+        await products_db.set_user_active(user_id=target_id, is_active=False)
+        await message.answer(f"OK: user {target_id} відключено (admin знято, is_active=0).")
+
     @router.message(Command("start"))
     async def _start(message: Message) -> None:
-        user_mode[message.from_user.id] = MODE_NAME
+        if not await _require_allowed(message):
+            return
+        uid = message.from_user.id
+        role_tag = await _get_access_role_tag(uid)
+        user_mode[uid] = MODE_NAME
+        effective_admin[uid] = (role_tag == "admin")
         await _send_main_hint(message, MODE_NAME)
 
     @router.message(Command("reload"))
     async def _reload(message: Message) -> None:
-        if not _is_admin_user(message):
+        if not await _require_admin(message):
             return
         cache.clear()
         # Keep modes as-is
@@ -192,7 +419,7 @@ def register_handlers(products_db: ProductsDB) -> None:
 
     @router.message(F.document)
     async def _document_import(message: Message) -> None:
-        if not _is_admin_user(message):
+        if not await _require_admin(message):
             return
 
         doc = message.document
@@ -236,6 +463,11 @@ def register_handlers(products_db: ProductsDB) -> None:
             return
 
         uid = message.from_user.id
+        role_tag = await _get_access_role_tag(uid)
+        if role_tag is None:
+            await message.answer("Доступ заборонено")
+            return
+
         active_mode = user_mode.get(uid, MODE_NAME)
 
         # Button click handling (text buttons)
@@ -260,8 +492,16 @@ def register_handlers(products_db: ProductsDB) -> None:
             return
 
         # Query handling
+        # Try to delete the user's message so the mobile soft keyboard folds back
+        # and results occupy the screen.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
         kb = _make_keyboard(active_mode)
-        key = _cache_key(active_mode, text)
+        is_admin = role_tag == "admin" and effective_admin.get(uid, True)
+        key = _cache_key(active_mode, text, is_admin)
 
         cached = cache.get(key)
         if cached is not None:
@@ -284,7 +524,13 @@ def register_handlers(products_db: ProductsDB) -> None:
                 await _answer_not_found(message, active_mode)
                 return
 
-            response_lines = [_format_match_line(m.code, m.name, m.price) for m in matches]
+            if is_admin:
+                response_lines = [
+                    _format_match_line_admin(m.code, m.name, m.price, m.purchase_price)
+                    for m in matches
+                ]
+            else:
+                response_lines = [_format_match_line(m.code, m.name, m.price) for m in matches]
             response = "\n".join(response_lines)
 
             cache.set(key, response)
