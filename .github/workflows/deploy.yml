@@ -1,0 +1,111 @@
+name: Deploy Price Bot (Production)
+
+on:
+    push:
+        branches:
+            - main
+
+concurrency:
+    group: price-bot-deploy
+    cancel-in-progress: true
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Deploy to VM
+              uses: appleboy/ssh-action@v1.0.3
+
+              with:
+                  host: ${{ secrets.VM_HOST }}
+                  username: ${{ secrets.VM_USER }}
+                  key: ${{ secrets.VM_SSH_KEY }}
+
+                  script: |
+                      set -euo pipefail
+
+                      REPO_DIR="/home/ubuntu/price"
+                      SERVICE_NAME="price-bot"
+
+                      echo "Deploying Price Bot..."
+                      cd "$REPO_DIR"
+
+                      # ------------------------------------------------------------
+                      # 0. LOCK (prevent double deploy)
+                      # ------------------------------------------------------------
+                      LOCK_FILE="/tmp/price-bot.lock"
+
+                      if [ -f "$LOCK_FILE" ]; then
+                        echo "Deploy already running"
+                        exit 1
+                      fi
+
+                      touch "$LOCK_FILE"
+
+                      cleanup() {
+                        rm -f "$LOCK_FILE"
+                      }
+
+                      trap cleanup EXIT
+
+                      # ------------------------------------------------------------
+                      # 1. SAVE CURRENT COMMIT (ROLLBACK POINT)
+                      # ------------------------------------------------------------
+                      OLD_COMMIT=$(git rev-parse HEAD)
+
+                      # ------------------------------------------------------------
+                      # 2. STOP SERVICE
+                      # ------------------------------------------------------------
+                      sudo systemctl stop "$SERVICE_NAME" || true
+
+                      # ------------------------------------------------------------
+                      # 3. UPDATE CODE (SAFE)
+                      # ------------------------------------------------------------
+                      git fetch origin main
+                      git reset --hard origin/main
+
+                      # IMPORTANT: NEVER TOUCH THESE
+                      # venv / db / env
+                      git clean -fd \
+                        -e venv \
+                        -e .env \
+                        -e "*.db" \
+                        -e data
+
+                      # ------------------------------------------------------------
+                      # 4. VENV SAFE REBUILD (only if broken)
+                      # ------------------------------------------------------------
+                      if [ ! -d "venv" ] || [ ! -x "venv/bin/python" ]; then
+                        echo "Recreating venv..."
+                        python3 -m venv --clear venv
+                      fi
+
+                      venv/bin/pip install --upgrade pip
+                      venv/bin/pip install -r requirements.txt
+
+                      # ------------------------------------------------------------
+                      # 5. START SERVICE
+                      # ------------------------------------------------------------
+                      sudo systemctl restart "$SERVICE_NAME"
+
+                      sleep 5
+
+                      # ------------------------------------------------------------
+                      # 6. HEALTH CHECK
+                      # ------------------------------------------------------------
+                      if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+                        echo "❌ SERVICE FAILED → ROLLBACK"
+
+                        sudo systemctl status "$SERVICE_NAME" --no-pager || true
+                        journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
+
+                        echo "Rolling back to: $OLD_COMMIT"
+                        git reset --hard "$OLD_COMMIT"
+
+                        sudo systemctl restart "$SERVICE_NAME"
+
+                        exit 1
+                      fi
+
+                      echo "✅ Deploy successful"
