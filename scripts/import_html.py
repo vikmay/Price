@@ -27,7 +27,13 @@ NAME_CLEAN_RE = re.compile(r"\s+")
 # - "4,50"
 # Allow either decimal comma/dot. Thousands separators may appear.
 PRICE_RE = re.compile(
-    r"(?P<price>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)[\s]*",
+    # Make sure we don't match only a prefix like "220" inside "2200,00".
+    # Support:
+    # - 960,00
+    # - 4,50
+    # - 2.200,00 / 2,200.00 (thousands + decimal)
+    # - 2200,00 / 2200.00
+    r"(?P<price>(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?)[\s]*",
     re.IGNORECASE,
 )
 

@@ -101,7 +101,13 @@ def _is_admin_user(message: Message) -> bool:
 
 
 _PRICE_EXTRACT_RE = re.compile(
-    r"(?P<price>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
+    # Avoid matching only a prefix like "220" inside "2200,00".
+    # Support:
+    # - 960,00
+    # - 4,50
+    # - 2.200,00 / 2,200.00 (thousands + decimal)
+    # - 2200,00 / 2200.00
+    r"(?P<price>(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?)[\s]*",
 )
 
 
@@ -113,7 +119,11 @@ def _parse_price_exact(text: str) -> float | None:
     if not text:
         return None
 
-    match = _PRICE_EXTRACT_RE.search(text)
+    # Normalize spaces inside numbers: "2 200,00" / "2 200,00" -> "2200,00"
+    normalized = text.replace("\u00A0", " ")
+    normalized = re.sub(r"(?<=\d)\s+(?=\d)", "", normalized)
+
+    match = _PRICE_EXTRACT_RE.search(normalized)
     if not match:
         return None
 
