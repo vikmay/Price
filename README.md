@@ -98,4 +98,3 @@ Indexes:
 
 - Bot queries run via SQLite indexes + `LIMIT 5`.
 - DB access is async-safe by using `run_in_executor` (no full dataset loading into memory).
-- Optional small TTL cache reduces repeated queries.
