@@ -14,9 +14,13 @@ from app.handlers import register_handlers, router
 
 def setup_logging() -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    # Reduce aiogram per-update noise; keep only warnings/errors by default.
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+    logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
 
 
 async def _bootstrap_admin_if_needed(products_db: ProductsDB) -> None:

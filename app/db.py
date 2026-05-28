@@ -355,6 +355,98 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
         conn.close()
 
 
+def _search_products_unified_sync(db_path: str, query: str, limit: int) -> list[ProductMatch]:
+    """
+    Unified search:
+      - if user input is digits-only (after strip), show:
+          1) code exact match first (code is unique => effectively 0/1 rows)
+          2) then products where those digits appear in the product name
+             (prefix first, then substring)
+      - else: fallback to the existing name-only search logic.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    conn = _get_conn(db_path)
+    try:
+        rows: list[ProductMatch] = []
+        seen_codes: set[str] = set()
+
+        if q.isdigit():
+            clean_code = _normalize_code(q)
+            if clean_code:
+                cur = conn.execute(
+                    """
+                    SELECT code, name, price, purchase_price, updated_at
+                    FROM products
+                    WHERE code = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?;
+                    """,
+                    (clean_code, limit),
+                )
+                for row in cur.fetchall():
+                    code = str(row["code"])
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    rows.append(_row_to_match(row))
+
+            if len(rows) < limit:
+                remaining = limit - len(rows)
+                q_cf = _casefold_str(q)
+
+                # digits at the beginning of name
+                prefix_like = f"{q_cf}%"
+                cur2 = conn.execute(
+                    """
+                    SELECT code, name, price, purchase_price, updated_at
+                    FROM products
+                    WHERE name_cf LIKE ?
+                    ORDER BY name_cf
+                    LIMIT ?;
+                    """,
+                    (prefix_like, remaining),
+                )
+                for row in cur2.fetchall():
+                    code = str(row["code"])
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    rows.append(_row_to_match(row))
+                    if len(rows) >= limit:
+                        break
+
+            if len(rows) < limit:
+                remaining = limit - len(rows)
+                q_cf = _casefold_str(q)
+                substring_like = f"%{q_cf}%"
+                cur3 = conn.execute(
+                    """
+                    SELECT code, name, price, purchase_price, updated_at
+                    FROM products
+                    WHERE name_cf LIKE ?
+                    ORDER BY name_cf
+                    LIMIT ?;
+                    """,
+                    (substring_like, remaining),
+                )
+                for row in cur3.fetchall():
+                    code = str(row["code"])
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    rows.append(_row_to_match(row))
+
+            return rows
+
+        # Non-digit query => keep your existing ranking behavior for names.
+        return _search_products_by_name_only_sync(db_path, q, limit)
+    finally:
+        conn.close()
+
+
 def _search_products_sync(db_path: str, query: str, limit: int) -> list[ProductMatch]:
     """
     Combined search (code exact if possible, then name search).
@@ -676,6 +768,14 @@ class ProductsDB:
     ) -> list[ProductMatch]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _search_products_by_price_exact_sync, self._db_path, price, limit)
+
+    async def search_products_unified(
+        self,
+        query: str,
+        limit: int = DEFAULT_LIMIT,
+    ) -> list[ProductMatch]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _search_products_unified_sync, self._db_path, query, limit)
 
     async def insert_or_update_product(
         self,
