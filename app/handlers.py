@@ -57,7 +57,7 @@ class SimpleTTLCache:
 
 def _format_match_line(code: str, name: str, retail_price: float) -> str:
     retail_str = f"{retail_price:.2f}"
-    return f"{code} — {name} — {retail_str}"
+    return f"{code} {name} — {retail_str}"
 
 
 def _format_match_line_admin(
@@ -68,9 +68,9 @@ def _format_match_line_admin(
 ) -> str:
     retail_str = f"{retail_price:.2f}"
     if purchase_price is None:
-        return f"{code} — {name} — {retail_str}"
+        return f"{code} {name} — {retail_str}"
     purchase_str = f"{purchase_price:.2f}"
-    return f"{code} — {name} — {retail_str}({purchase_str})"
+    return f"{code} {name} — {retail_str}({purchase_str})"
 
 
 async def _download_document_to_path(message: Message, destination: Path) -> None:
