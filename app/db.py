@@ -306,11 +306,13 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                 if len(rows) >= limit:
                     break
 
-        if len(rows) < limit:
+        # For multi-token queries: ALL tokens must be present in the name.
+        # Results where the tokens appear as a contiguous phrase get priority.
+        if not is_single_token:
             tokens = [t for t in q_cf.split() if t]
             if len(tokens) >= 2:
-                remaining = limit - len(rows)
                 params = [f"%{t}%" for t in tokens]
+                substring_like_full = f"%{q_cf}%"
 
                 where_and = " AND ".join(["name_cf LIKE ?"] * len(tokens))
                 cur3 = conn.execute(
@@ -318,9 +320,15 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                     SELECT code, name, price, purchase_price, updated_at
                     FROM products
                     WHERE {where_and}
+                    ORDER BY
+                        CASE
+                            WHEN name_cf LIKE ? THEN 0
+                            ELSE 1
+                        END,
+                        name_cf
                     LIMIT ?;
                     """,
-                    (*params, remaining),
+                    (*params, substring_like_full, limit),
                 )
                 for row in cur3.fetchall():
                     code = str(row["code"])
@@ -330,27 +338,6 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                     rows.append(_row_to_match(row))
                     if len(rows) >= limit:
                         break
-
-                if len(rows) < limit:
-                    remaining = limit - len(rows)
-                    where_or = " OR ".join(["name_cf LIKE ?"] * len(tokens))
-                    cur4 = conn.execute(
-                        f"""
-                        SELECT code, name, price, purchase_price, updated_at
-                        FROM products
-                        WHERE {where_or}
-                        LIMIT ?;
-                        """,
-                        (*params, remaining),
-                    )
-                    for row in cur4.fetchall():
-                        code = str(row["code"])
-                        if code in existing_codes:
-                            continue
-                        existing_codes.add(code)
-                        rows.append(_row_to_match(row))
-                        if len(rows) >= limit:
-                            break
 
         return rows
     finally:
