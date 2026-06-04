@@ -306,9 +306,10 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                 if len(rows) >= limit:
                     break
 
-        if not rows:
+        if len(rows) < limit:
             tokens = [t for t in q_cf.split() if t]
             if len(tokens) >= 2:
+                remaining = limit - len(rows)
                 params = [f"%{t}%" for t in tokens]
 
                 where_and = " AND ".join(["name_cf LIKE ?"] * len(tokens))
@@ -319,7 +320,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                     WHERE {where_and}
                     LIMIT ?;
                     """,
-                    (*params, limit),
+                    (*params, remaining),
                 )
                 for row in cur3.fetchall():
                     code = str(row["code"])
@@ -330,7 +331,8 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                     if len(rows) >= limit:
                         break
 
-                if not rows:
+                if len(rows) < limit:
+                    remaining = limit - len(rows)
                     where_or = " OR ".join(["name_cf LIKE ?"] * len(tokens))
                     cur4 = conn.execute(
                         f"""
@@ -339,7 +341,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                         WHERE {where_or}
                         LIMIT ?;
                         """,
-                        (*params, limit),
+                        (*params, remaining),
                     )
                     for row in cur4.fetchall():
                         code = str(row["code"])
