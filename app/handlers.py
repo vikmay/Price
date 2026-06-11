@@ -354,6 +354,17 @@ def register_handlers(products_db: ProductsDB) -> None:
 
             imported_count = await loop.run_in_executor(None, _do_import)
             cache.clear()
+
+            # Сповіщення всіх активних користувачів про оновлення цін
+            users_to_notify: list[int] = []
+            for role in ("admin", "allowed"):
+                users_to_notify.extend(await products_db.list_users_by_role(role))
+            for uid in users_to_notify:
+                try:
+                    await message.bot.send_message(uid, "Ціни оновлено ✅")
+                except Exception:
+                    pass
+
             await _answer(message, f"Імпорт завершено. Записів: {imported_count}")
         except Exception:
             cache.clear()
