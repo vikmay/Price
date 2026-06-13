@@ -5,6 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+import html
 from pathlib import Path
 from typing import Final
 
@@ -56,8 +57,8 @@ class SimpleTTLCache:
 
 
 def _format_match_line(code: str, name: str, retail_price: float) -> str:
-    retail_str = f"{retail_price:.2f}"
-    return f"{code} {name} — {retail_str}"
+    retail_str = f"<b>{retail_price:.2f}</b>"
+    return f"{html.escape(code)} {html.escape(name)} — {retail_str}"
 
 
 def _format_match_line_admin(
@@ -66,11 +67,11 @@ def _format_match_line_admin(
     retail_price: float,
     purchase_price: float | None,
 ) -> str:
-    retail_str = f"{retail_price:.2f}"
+    retail_str = f"<b>{retail_price:.2f}</b>"
     if purchase_price is None:
-        return f"{code} {name} — {retail_str}"
-    purchase_str = f"{purchase_price:.2f}"
-    return f"{code} {name} — {retail_str}({purchase_str})"
+        return f"{html.escape(code)} {html.escape(name)} — {retail_str}"
+    purchase_str = f"<b>{purchase_price:.2f}</b>"
+    return f"{html.escape(code)} {html.escape(name)} — {retail_str} ({purchase_str})"
 
 
 async def _download_document_to_path(message: Message, destination: Path) -> None:
@@ -394,7 +395,7 @@ def register_handlers(products_db: ProductsDB) -> None:
 
         cached = cache.get(key)
         if cached is not None:
-            await message.answer(cached, reply_markup=reply_remove)
+            await message.answer(cached, reply_markup=reply_remove, parse_mode="HTML")
             return
 
         try:
@@ -415,7 +416,7 @@ def register_handlers(products_db: ProductsDB) -> None:
             response = "\n".join(response_lines)
 
             cache.set(key, response)
-            await message.answer(response, reply_markup=reply_remove)
+            await message.answer(response, reply_markup=reply_remove, parse_mode="HTML")
 
         except Exception:
             await _answer(message, "Помилка під час пошуку. Спробуйте ще раз.")
