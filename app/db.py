@@ -247,11 +247,11 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
             """
             SELECT code, name, price, purchase_price, updated_at
             FROM products
-            WHERE name_cf LIKE ?
+            WHERE (code || ' ' || name_cf) LIKE ?
             ORDER BY
                 CASE
-                    WHEN name_cf = ? THEN 0
-                    WHEN name_cf LIKE ? THEN 1
+                    WHEN (code || ' ' || name_cf) = ? THEN 0
+                    WHEN (code || ' ' || name_cf) LIKE ? THEN 1
                     ELSE 2
                 END,
                 name_cf
@@ -274,14 +274,14 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                 """
                 SELECT code, name, price, purchase_price, updated_at
                 FROM products
-                WHERE name_cf LIKE ?
+                WHERE (code || ' ' || name_cf) LIKE ?
                 ORDER BY
                     CASE
-                        WHEN name_cf = ? THEN 0
-                        WHEN name_cf LIKE ? THEN 1
-                        WHEN name_cf LIKE ? THEN 1
-                        WHEN name_cf LIKE ? THEN 1
-                        WHEN name_cf LIKE ? THEN 2
+                        WHEN (code || ' ' || name_cf) = ? THEN 0
+                        WHEN (code || ' ' || name_cf) LIKE ? THEN 1
+                        WHEN (code || ' ' || name_cf) LIKE ? THEN 1
+                        WHEN (code || ' ' || name_cf) LIKE ? THEN 1
+                        WHEN (code || ' ' || name_cf) LIKE ? THEN 2
                         ELSE 3
                     END,
                     name_cf
@@ -314,7 +314,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                 params = [f"%{t}%" for t in tokens]
                 substring_like_full = f"%{q_cf}%"
 
-                where_and = " AND ".join(["name_cf LIKE ?"] * len(tokens))
+                where_and = " AND ".join(["(code || ' ' || name_cf) LIKE ?"] * len(tokens))
                 cur3 = conn.execute(
                     f"""
                     SELECT code, name, price, purchase_price, updated_at
@@ -322,7 +322,7 @@ def _search_products_by_name_only_sync(db_path: str, query: str, limit: int) -> 
                     WHERE {where_and}
                     ORDER BY
                         CASE
-                            WHEN name_cf LIKE ? THEN 0
+                            WHEN (code || ' ' || name_cf) LIKE ? THEN 0
                             ELSE 1
                         END,
                         name_cf
