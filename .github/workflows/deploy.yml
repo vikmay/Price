@@ -17,10 +17,14 @@ jobs:
             - name: Deploy to VM
               uses: appleboy/ssh-action@v1.0.3
 
+              env:
+                  PRICE_SYNC_KEY: ${{ secrets.PRICE_SYNC_KEY }}
+
               with:
                   host: ${{ secrets.VM_HOST }}
                   username: ${{ secrets.VM_USER }}
                   key: ${{ secrets.VM_SSH_KEY }}
+                  envs: PRICE_SYNC_KEY
 
                   script: |
                       set -euo pipefail
@@ -83,6 +87,10 @@ jobs:
 
                       venv/bin/pip install --upgrade pip
                       venv/bin/pip install -r requirements.txt
+
+                      # Optional C3 receiver setup. Existing installations remain
+                      # unchanged until PRICE_SYNC_KEY is configured in GitHub Secrets.
+                      venv/bin/python scripts/configure_c3_sync.py --if-configured
 
                       # ------------------------------------------------------------
                       # 5. START SERVICE

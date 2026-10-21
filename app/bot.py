@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher
 from app.config import load_settings
 from app.db import ProductsDB, connect
 from app.handlers import register_handlers, router
+from app.price_sync import start_receiver
 
 
 def setup_logging() -> None:
@@ -63,13 +64,17 @@ async def main() -> None:
 
     products_db = ProductsDB(settings.DB_PATH)
     await _bootstrap_admin_if_needed(products_db)
-    register_handlers(products_db)
+    invalidate_cache = register_handlers(products_db)
 
     dp.include_router(router)
 
+    receiver = None
     try:
+        receiver = await start_receiver(settings.DB_PATH, invalidate_cache)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if receiver is not None:
+            await receiver.cleanup()
         await bot.session.close()
 
 

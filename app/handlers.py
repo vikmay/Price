@@ -27,6 +27,7 @@ class CacheEntry:
 
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 30, max_items: int = 200) -> None:
+        self.generation = 0
         self._ttl_seconds = ttl_seconds
         self._max_items = max_items
         self._items: dict[str, CacheEntry] = {}
@@ -53,6 +54,7 @@ class SimpleTTLCache:
         self._items[key] = CacheEntry(text=value, expires_at=time.time() + self._ttl_seconds)
 
     def clear(self) -> None:
+        self.generation += 1
         self._items.clear()
 
 
@@ -91,7 +93,7 @@ async def _download_document_to_path(message: Message, destination: Path) -> Non
     await message.bot.download_file(tg_file.file_path, destination=dest)
 
 
-def register_handlers(products_db: ProductsDB) -> None:
+def register_handlers(products_db: ProductsDB):
     cache = SimpleTTLCache(ttl_seconds=30, max_items=300)
     effective_admin: dict[int, bool] = {}
 
@@ -329,6 +331,10 @@ def register_handlers(products_db: ProductsDB) -> None:
         if not await _require_admin(message):
             return
 
+        if os.getenv("PRICE_SYNC_KEY"):
+            await _answer(message, "Прайс оновлюється з C3 Trade автоматично. Імпорт HTML вимкнено на час автоматичного обміну.")
+            return
+
         doc = message.document
         if not doc:
             return
@@ -399,6 +405,7 @@ def register_handlers(products_db: ProductsDB) -> None:
             return
 
         try:
+            generation = cache.generation
             matches = await products_db.search_products_unified(text, limit=20)
 
             if not matches:
@@ -415,8 +422,11 @@ def register_handlers(products_db: ProductsDB) -> None:
 
             response = "\n".join(response_lines)
 
-            cache.set(key, response)
+            if generation == cache.generation:
+                cache.set(key, response)
             await message.answer(response, reply_markup=reply_remove, parse_mode="HTML")
 
         except Exception:
             await _answer(message, "Помилка під час пошуку. Спробуйте ще раз.")
+
+    return cache.clear
