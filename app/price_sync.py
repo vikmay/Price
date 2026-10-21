@@ -105,7 +105,7 @@ def create_app(db_path: str, key: str, invalidate_cache) -> web.Application:
             return web.json_response({"error": "Unauthorized"}, status=401)
         try:
             payload = await request.json()
-            applied = await asyncio.to_thread(apply_batch, db_path, payload)
+            applied = await asyncio.get_running_loop().run_in_executor(None, apply_batch, db_path, payload)
         except (ValueError, TypeError, OverflowError):
             return web.json_response({"error": "Invalid catalog or source/sequence conflict"}, status=400)
         if applied:

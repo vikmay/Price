@@ -2,6 +2,7 @@ from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -86,6 +87,10 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT sequence FROM c3_price_sync").fetchone()[0], 1)
 
     async def test_http_auth_and_cache_invalidation(self):
+        # Production Oracle VM uses Python 3.8, which has no asyncio.to_thread.
+        legacy_api = patch("asyncio.to_thread", None, create=True)
+        legacy_api.start()
+        self.addCleanup(legacy_api.stop)
         invalidations = []
         app = create_app(self.db, KEY, lambda: invalidations.append(True))
         async with TestClient(TestServer(app)) as client:
