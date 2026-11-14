@@ -41,6 +41,9 @@ IMAGE_SUFFIX: Final = (".jpg", ".jpeg", ".png", ".webp")
 PHOTO_BUTTON: Final = "Додати фото"
 CANCEL_BUTTON: Final = "Скасувати"
 RETRY_BUTTON: Final = "Повторити надсилання"
+SAVE_BUTTON: Final = "Зберегти фото"
+MAX_ALBUM_ITEMS: Final = 10
+MAX_RECEIPTS: Final = 500
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -58,6 +61,14 @@ def _step_menu() -> ReplyKeyboardMarkup:
 def _pending_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=RETRY_BUTTON)], [KeyboardButton(text=CANCEL_BUTTON)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def _album_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=SAVE_BUTTON)], [KeyboardButton(text=CANCEL_BUTTON)]],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -326,6 +337,34 @@ class Pending:
 
 
 @dataclass
+class AlbumItem:
+    message_id: int
+    file_id: str
+    file_size: int | None
+    request_id: str
+    data: bytes | None = None
+    done: bool = False
+    failed: bool = False
+
+
+@dataclass
+class Album:
+    group_id: str
+    selection: Selection
+    expires_at: float
+    items: dict[int, AlbumItem] = field(default_factory=dict)
+    order: list[int] = field(default_factory=list)
+    started: bool = False
+
+
+@dataclass(frozen=True)
+class SendResult:
+    outcome: str
+    message: str = ""
+    version: str = ""
+
+
+@dataclass
 class Flow:
     user_id: int
     chat_id: int
@@ -333,23 +372,53 @@ class Flow:
     selections: dict[str, Selection] = field(default_factory=dict)
     chosen: Selection | None = None
     pending: Pending | None = None
+    album: Album | None = None
     expires_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _receipt_key(user_id: int, chat_id: int, group_id: str) -> str:
+    return f"{user_id}:{chat_id}:{group_id}"
 
 
 class PhotoFlows:
     def __init__(self) -> None:
         self._flows: dict[int, Flow] = {}
+        self._receipts: dict[str, tuple[float, str]] = {}
         self._bytes = 0
 
     def prune(self) -> None:
         now = time.time()
+        for group_id in [
+            group_id for group_id, (expires_at, _) in self._receipts.items() if expires_at <= now
+        ]:
+            self._receipts.pop(group_id, None)
         for user_id in [
             uid
             for uid, flow in self._flows.items()
             if flow.expires_at <= now and not flow.lock.locked()
         ]:
             self.clear(user_id)
+
+    def receipt(self, user_id: int, chat_id: int, group_id: str) -> str | None:
+        key = _receipt_key(user_id, chat_id, group_id)
+        entry = self._receipts.get(key)
+        if entry is None:
+            return None
+        if entry[0] <= time.time():
+            self._receipts.pop(key, None)
+            return None
+        return entry[1]
+
+    def mark_receipt(self, user_id: int, chat_id: int, group_id: str, status: str) -> None:
+        if not group_id:
+            return
+        key = _receipt_key(user_id, chat_id, group_id)
+        self.prune()
+        if len(self._receipts) >= MAX_RECEIPTS:
+            oldest = min(self._receipts, key=lambda item: self._receipts[item][0])
+            self._receipts.pop(oldest, None)
+        self._receipts[key] = (time.time() + FLOW_TTL, status)
 
     def begin(self, user_id: int, chat_id: int) -> Flow | None:
         self.prune()
@@ -385,15 +454,24 @@ class PhotoFlows:
         self.clear(user_id)
         return True
 
-    def clear(self, user_id: int) -> None:
+    def clear(self, user_id: int, receipt: str = "cancelled") -> None:
         flow = self._flows.pop(user_id, None)
         if flow is None:
             return
         if flow.pending is not None:
             self._bytes = max(0, self._bytes - len(flow.pending.data))
+        if flow.album is not None:
+            for item in flow.album.items.values():
+                if item.data is not None:
+                    self._bytes = max(0, self._bytes - len(item.data))
+                    item.data = None
+            self.mark_receipt(
+                flow.album.selection.user_id, flow.album.selection.chat_id, flow.album.group_id, receipt
+            )
 
     def clear_all(self) -> None:
         self._flows.clear()
+        self._receipts.clear()
         self._bytes = 0
 
     def reserve(self, size: int) -> bool:
@@ -469,6 +547,11 @@ def register_photo_handlers(
     def _current(flow: Flow, selection: Selection) -> bool:
         return flows.get(flow.user_id) is flow and flow.chosen is selection
 
+    def _album_open(album: Album | None) -> bool:
+        if album is None:
+            return False
+        return any(not item.done and not item.failed for item in album.items.values())
+
     async def _search(message: Message, flow: Flow, query: str) -> None:
         try:
             loop = asyncio.get_running_loop()
@@ -528,71 +611,84 @@ def register_photo_handlers(
             raise PhotoUploadError("Порожній файл фото.")
         return data
 
-    async def _send(message: Message, flow: Flow, pending: Pending) -> None:
+    async def _send(
+        message: Message, flow: Flow, pending: Pending, finalize: bool = True
+    ) -> SendResult:
         selection = pending.selection
         product = selection.product
         if not _current(flow, selection):
-            return
+            return SendResult("stale")
         try:
             loop = asyncio.get_running_loop()
             current = await loop.run_in_executor(
                 None, _product_sync, products_db.db_path, product.c3_id
             )
         except Exception:
-            if _current(flow, selection):
+            if _current(flow, selection) and finalize:
                 await _answer(message, "Помилка читання каталогу. Натисніть «Повторити надсилання».", _pending_menu())
-            return
+            return SendResult("retry", "Помилка читання каталогу.")
         if not _current(flow, selection):
-            return
+            return SendResult("stale")
         if current is None or current.source != product.source or current.generation != product.generation:
             flows.drop_pending(flow)
             flow.chosen = None
             flow.mode = "search"
-            await _answer(
-                message,
-                "Каталог C3 змінився. Натисніть «Додати фото» і виберіть товар повторно.",
-                main_menu(),
-            )
-            return
+            if finalize:
+                await _answer(
+                    message,
+                    "Каталог C3 змінився. Натисніть «Додати фото» і виберіть товар повторно.",
+                    main_menu(),
+                )
+            return SendResult("conflict", "Каталог C3 змінився.")
         client = _client(flow, product)
         if client is None:
             flows.drop_pending(flow)
-            await _answer(message, _diagnose(product), main_menu())
-            return
+            if finalize:
+                await _answer(message, _diagnose(product), main_menu())
+            return SendResult("fatal", _diagnose(product))
         if (await role_of(flow.user_id)) is None:
             flows.clear(flow.user_id)
-            await _answer(message, "Доступ заборонено")
-            return
+            if finalize:
+                await _answer(message, "Доступ заборонено")
+            return SendResult("denied", "Доступ заборонено")
         if not _current(flow, selection):
-            return
+            return SendResult("stale")
         try:
-            await client.upload(
+            result = await client.upload(
                 product.c3_id, selection.identity, pending.request_id, pending.data,
                 selection.gallery_version,
             )
         except PhotoUploadError as ex:
             if not _current(flow, selection):
-                return
+                return SendResult("stale")
             if ex.conflict:
                 flows.drop_pending(flow)
                 flow.chosen = None
                 flow.mode = "search"
-                await _answer(message, ex.message, main_menu())
-                return
+                if finalize:
+                    await _answer(message, ex.message, main_menu())
+                return SendResult("conflict", ex.message)
             if ex.retryable:
-                await _answer(message, ex.message, _pending_menu())
-                return
+                if finalize:
+                    await _answer(message, ex.message, _pending_menu())
+                return SendResult("retry", ex.message)
             flows.drop_pending(flow)
-            await _answer(message, ex.message, main_menu())
-            return
+            if finalize:
+                await _answer(message, ex.message, main_menu())
+            return SendResult("fatal", ex.message)
         if not _current(flow, selection):
-            return
-        flows.clear(flow.user_id)
-        await message.answer(
-            f"Фото додано: {html.escape(product.code)} {html.escape(product.name)}",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
+            return SendResult("stale")
+        version = _gallery_version(result)
+        if version:
+            selection.gallery_version = version
+        if finalize:
+            flows.clear(flow.user_id, "saved")
+            await message.answer(
+                f"Фото додано: {html.escape(product.code)} {html.escape(product.name)}",
+                parse_mode="HTML",
+                reply_markup=main_menu(),
+            )
+        return SendResult("ok", "", version)
 
     async def _accept(message: Message, flow: Flow, file_id: str, file_size: int | None) -> None:
         if not await _hold(flow.lock):
@@ -607,6 +703,13 @@ def register_photo_handlers(
                     message,
                     "Попереднє фото ще не збережено. Натисніть «Повторити надсилання» або «Скасувати».",
                     _pending_menu(),
+                )
+                return
+            if _album_open(flow.album):
+                await _answer(
+                    message,
+                    "Спочатку натисніть «Зберегти фото» або «Скасувати» для альбому.",
+                    _album_menu(),
                 )
                 return
             flows.drop_pending(flow)
@@ -646,6 +749,171 @@ def register_photo_handlers(
         finally:
             flow.lock.release()
 
+    async def _collect(
+        message: Message, flow: Flow, file_id: str, file_size: int | None, group_id: str
+    ) -> None:
+        text = ""
+        markup = None
+        async with flow.lock:
+            if flows.get(flow.user_id) is not flow:
+                text, markup = "Вибір товару втрачено. Натисніть «Додати фото».", main_menu()
+            elif flows.receipt(flow.user_id, flow.chat_id, group_id) is not None:
+                return
+            else:
+                selection = flow.chosen
+                album = flow.album
+                if selection is None or selection.expires_at <= time.time():
+                    flow.chosen = None
+                    text, markup = "Вибір товару застарів. Натисніть «Додати фото».", main_menu()
+                elif album is not None and (album.group_id != group_id or album.selection is not selection):
+                    text, markup = (
+                        "Альбом уже збирається для іншого вибору. Натисніть «Скасувати».",
+                        _album_menu(),
+                    )
+                elif album is not None and message.message_id in album.items:
+                    return
+                elif album is not None and album.started:
+                    text, markup = (
+                        "Альбом уже зберігається. Дочекайтеся завершення «Зберегти фото».",
+                        _album_menu(),
+                    )
+                elif album is None and flow.pending is not None and flow.pending.expires_at > time.time():
+                    text, markup = (
+                        "Попереднє фото ще не збережено. Натисніть «Повторити надсилання» або «Скасувати».",
+                        _pending_menu(),
+                    )
+                else:
+                    if album is None:
+                        flows.drop_pending(flow)
+                        album = Album(group_id, selection, time.time() + FLOW_TTL)
+                        flow.album = album
+                        flow.mode = "album"
+                    if len(album.items) >= MAX_ALBUM_ITEMS:
+                        text, markup = "В альбомі може бути не більше 10 фото.", _album_menu()
+                    else:
+                        album.items[message.message_id] = AlbumItem(
+                            message.message_id, file_id, file_size, str(uuid4())
+                        )
+                        album.order.append(message.message_id)
+                        album.expires_at = time.time() + FLOW_TTL
+                        flow.expires_at = time.time() + FLOW_TTL
+                        text, markup = (
+                            f"Отримано {len(album.items)} фото з альбому."
+                            f" Натисніть «{SAVE_BUTTON}», щоб зберегти їх у галерею товару.",
+                            _album_menu(),
+                        )
+        if text:
+            await _answer(message, text, markup)
+
+    async def _drain(message: Message, flow: Flow, album: Album) -> None:
+        selection = album.selection
+        product = selection.product
+        album.started = True
+        saved = sum(1 for item in album.items.values() if item.done)
+        total = len(album.order)
+        problem = ""
+        outcome = "ok"
+        for message_id in sorted(album.order):
+            item = album.items.get(message_id)
+            if item is None or item.done or item.failed:
+                continue
+            if not _current(flow, selection):
+                outcome = "stale"
+                break
+            if item.data is None:
+                if item.file_size is not None and item.file_size > MAX_UPLOAD_BYTES:
+                    item.failed = True
+                    problem = "Фото має бути не більше 20 МБ."
+                    continue
+                if not flows.reserve(MAX_UPLOAD_BYTES):
+                    problem = "Зачекайте: одночасно обробляється забагато фото."
+                    outcome = "retry"
+                    break
+                try:
+                    data = await _download(message, item.file_id)
+                except PhotoUploadError as ex:
+                    problem = ex.message
+                    if ex.retryable:
+                        outcome = "retry"
+                    else:
+                        item.failed = True
+                        continue
+                    break
+                finally:
+                    flows.release(MAX_UPLOAD_BYTES)
+                if not flows.reserve(len(data)):
+                    problem = "Зачекайте: одночасно обробляється забагато фото."
+                    outcome = "retry"
+                    break
+                item.data = data
+            result = await _send(
+                message,
+                flow,
+                Pending(item.request_id, item.data, selection, time.time() + FLOW_TTL),
+                finalize=False,
+            )
+            if result.outcome == "ok":
+                saved += 1
+                item.done = True
+                flows.release(len(item.data))
+                item.data = None
+                if not result.version and _album_open(album):
+                    problem = (
+                        "C3 Trade не повернув версію галереї."
+                        " Натисніть «Додати фото» і виберіть товар повторно."
+                    )
+                    outcome = "conflict"
+                    break
+                continue
+            outcome = result.outcome
+            problem = result.message
+            break
+        if outcome == "stale":
+            return
+        if outcome == "denied":
+            await _answer(message, f"Збережено {saved} із {total} фото. {problem}")
+            return
+        if outcome == "ok" and saved == total:
+            flows.clear(flow.user_id, "saved")
+            await message.answer(
+                f"Додано {saved} фото: {html.escape(product.code)} {html.escape(product.name)}",
+                parse_mode="HTML",
+                reply_markup=main_menu(),
+            )
+            return
+        if outcome in ("conflict", "fatal") or not _album_open(album):
+            flows.clear(flow.user_id, "saved" if saved else "cancelled")
+            await _answer(message, f"Збережено {saved} із {total} фото. {problem}", main_menu())
+            return
+        await _answer(
+            message,
+            f"Збережено {saved} із {total} фото. {problem}",
+            _pending_menu(),
+        )
+
+    @router.message(_CommandOrButton("save", SAVE_BUTTON))
+    async def _save(message: Message) -> None:
+        if message.chat.type != "private":
+            await _answer(message, "Команда доступна лише в приватному чаті.")
+            return
+        flow = flows.get(message.from_user.id)
+        if flow is None or flow.album is None:
+            await _answer(message, "Немає незавершеного альбому.", main_menu())
+            return
+        if (await role_of(message.from_user.id)) is None:
+            await _answer(message, "Доступ заборонено")
+            return
+        if not await _hold(flow.lock):
+            await _answer(message, "Зачекайте: фото вже надсилається.", _album_menu())
+            return
+        try:
+            if flows.get(message.from_user.id) is not flow or flow.album is None:
+                await _answer(message, "Немає незавершеного альбому.", main_menu())
+                return
+            await _drain(message, flow, flow.album)
+        finally:
+            flow.lock.release()
+
     @router.message(_CommandOrButton("photo", PHOTO_BUTTON))
     async def _photo_command(message: Message, command: CommandObject | None = None) -> None:
         if message.chat.type != "private":
@@ -661,6 +929,13 @@ def register_photo_handlers(
         try:
             if flows.get(message.from_user.id) is not flow:
                 await _answer(message, "Зачекайте: попереднє фото ще надсилається.", _pending_menu())
+                return
+            if _album_open(flow.album):
+                await _answer(
+                    message,
+                    "Спочатку натисніть «Зберегти фото» або «Скасувати» для альбому.",
+                    _album_menu(),
+                )
                 return
             flows.drop_pending(flow)
             flow.mode = "search"
@@ -695,7 +970,7 @@ def register_photo_handlers(
             await _answer(message, "Команда доступна лише в приватному чаті.")
             return
         flow = flows.get(message.from_user.id)
-        if flow is None or flow.pending is None:
+        if flow is None or (flow.pending is None and not _album_open(flow.album)):
             await _answer(message, "Немає незавершеного завантаження.", main_menu())
             return
         if (await role_of(message.from_user.id)) is None:
@@ -709,6 +984,9 @@ def register_photo_handlers(
                 await _answer(message, "Немає незавершеного завантаження.", main_menu())
                 return
             pending = flow.pending
+            if _album_open(flow.album):
+                await _drain(message, flow, flow.album)
+                return
             if pending is None:
                 await _answer(message, "Немає незавершеного завантаження.", main_menu())
                 return
@@ -740,7 +1018,7 @@ def register_photo_handlers(
             if flow.selections.get(selection.token) is not selection or selection.expires_at <= time.time():
                 await callback.answer("Вибір застарів. Натисніть «Додати фото».", show_alert=True)
                 return
-            if flow.pending is not None or flow.mode == "upload":
+            if flow.pending is not None or flow.mode == "upload" or _album_open(flow.album):
                 await callback.answer("Фото вже надсилається. Зачекайте.", show_alert=True)
                 return
             flow.selections = {selection.token: selection}
@@ -772,7 +1050,8 @@ def register_photo_handlers(
             await _answer(
                 message,
                 f"Надішліть фото товару {product.code} {product.name}, прикріпивши його через Telegram."
-                " Натисніть «Скасувати», щоб скасувати.",
+                f" Можна надіслати один файл або альбом до {MAX_ALBUM_ITEMS} фото: після альбому"
+                f" натисніть «{SAVE_BUTTON}», щоб зберегти всі фото. Натисніть «{CANCEL_BUTTON}», щоб скасувати.",
                 _step_menu(),
             )
         finally:
@@ -782,6 +1061,9 @@ def register_photo_handlers(
     async def _photo_message(message: Message) -> None:
         if message.chat.type != "private":
             raise SkipHandler
+        group_id = message.media_group_id
+        if group_id and flows.receipt(message.from_user.id, message.chat.id, group_id) is not None:
+            return
         flow = flows.get(message.from_user.id)
         if flow is None or flow.chosen is None:
             raise SkipHandler
@@ -789,6 +1071,9 @@ def register_photo_handlers(
             await _answer(message, "Доступ заборонено")
             return
         photo = message.photo[-1]
+        if group_id:
+            await _collect(message, flow, photo.file_id, photo.file_size, group_id)
+            return
         await _accept(message, flow, photo.file_id, photo.file_size)
 
     @router.message(F.document)
@@ -800,11 +1085,17 @@ def register_photo_handlers(
         name = (document.file_name or "").lower()
         if mime not in IMAGE_MIME and not name.endswith(IMAGE_SUFFIX):
             raise SkipHandler
+        group_id = message.media_group_id
+        if group_id and flows.receipt(message.from_user.id, message.chat.id, group_id) is not None:
+            return
         flow = flows.get(message.from_user.id)
         if flow is None or flow.chosen is None:
             raise SkipHandler
         if (await role_of(message.from_user.id)) is None:
             await _answer(message, "Доступ заборонено")
+            return
+        if group_id:
+            await _collect(message, flow, document.file_id, document.file_size, group_id)
             return
         await _accept(message, flow, document.file_id, document.file_size)
 
@@ -813,7 +1104,7 @@ def register_photo_handlers(
         text = (message.text or "").strip()
         if not text or text.startswith("/") or message.chat.type != "private":
             raise SkipHandler
-        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON):
+        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
             raise SkipHandler
         flow = flows.get(message.from_user.id)
         if flow is None or flow.mode != "search":

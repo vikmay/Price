@@ -18,6 +18,7 @@ from app.product_photos import (
     CANCEL_BUTTON,
     PHOTO_BUTTON,
     RETRY_BUTTON,
+    SAVE_BUTTON,
     flows,
     main_menu,
     register_photo_handlers,
@@ -408,7 +409,7 @@ def register_handlers(products_db: ProductsDB):
         text = (message.text or "").strip()
         if not text or text.startswith("/"):
             return
-        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON):
+        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
             return
 
         uid = message.from_user.id

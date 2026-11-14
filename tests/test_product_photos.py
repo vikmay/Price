@@ -98,6 +98,13 @@ class FakeC3:
         self.gallery_version = ""
         self.photo_version = ""
         self.payload: bytes | None = None
+        self.images: list[dict] = []
+        self.version_seq = 0
+        self.strict_versions = False
+        self.commit_then_fail = 0
+        self.conflict_after: int | None = None
+        self.omit_version = False
+        self.after_post = None
         self.app = web.Application()
         self.app.router.add_get("/api/photos/price/{id}", self.get_photo)
         self.app.router.add_post("/api/photos/price/{id}", self.post_photo)
@@ -135,7 +142,33 @@ class FakeC3:
             return web.json_response({"success": False, "message": "test"}, status=self.status)
         if self.payload is not None:
             return web.Response(body=self.payload, content_type="application/json")
-        return web.json_response({"success": True, "photo": {"version": "v"}})
+        request_id = request.headers.get("X-Photo-Request", "")
+        existing = next((item for item in self.images if item["request_id"] == request_id), None)
+        if existing is None:
+            if self.conflict_after is not None and len(self.images) >= self.conflict_after:
+                self.conflict_after = None
+                return web.json_response({"success": False, "message": "conflict"}, status=409)
+            sent = request.headers.get("X-Photo-Gallery-Version", "")
+            expected = self.gallery_version or self.photo_version
+            if self.strict_versions and sent != expected:
+                return web.json_response({"success": False, "message": "conflict"}, status=409)
+            self.version_seq += 1
+            version = f"rev-{self.version_seq}"
+            existing = {"request_id": request_id, "version": version, "body": body}
+            self.images.append(existing)
+            self.gallery_version = version
+            self.photo_version = version
+        if self.after_post is not None:
+            hook, self.after_post = self.after_post, None
+            await hook()
+        if self.commit_then_fail and len(self.images) >= self.commit_then_fail:
+            self.commit_then_fail = 0
+            return web.json_response({"success": False, "message": "lost"}, status=503)
+        if self.omit_version:
+            return web.json_response({"success": True})
+        return web.json_response(
+            {"success": True, "photo": {"version": existing["version"], "galleryVersion": existing["version"]}}
+        )
 
     def posts(self) -> list[tuple[str, str, dict, bytes]]:
         return [item for item in self.requests if item[0] == "POST"]
@@ -269,6 +302,48 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.dispatcher.feed_update(self.bot, Update(update_id=1, message=message))
 
+    async def send_album_photo(
+        self,
+        user_id: int,
+        file_id: str,
+        message_id: int,
+        group_id: str = "grp-1",
+        size: int | None = 1024,
+    ) -> None:
+        message = Message(
+            message_id=message_id,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=user_id, type="private"),
+            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            media_group_id=group_id,
+            photo=[PhotoSize(file_id=file_id, file_unique_id=file_id, width=10, height=10, file_size=size)],
+        )
+        await self.dispatcher.feed_update(self.bot, Update(update_id=message_id, message=message))
+
+    async def send_album_document(
+        self,
+        user_id: int,
+        file_id: str,
+        message_id: int,
+        group_id: str = "grp-1",
+        size: int | None = 1024,
+    ) -> None:
+        message = Message(
+            message_id=message_id,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=user_id, type="private"),
+            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            media_group_id=group_id,
+            document=Document(
+                file_id=file_id,
+                file_unique_id=file_id,
+                file_name="scan.jpg",
+                mime_type="image/jpeg",
+                file_size=size,
+            ),
+        )
+        await self.dispatcher.feed_update(self.bot, Update(update_id=message_id, message=message))
+
     async def press(self, user_id: int, data: str, chat_type: str = "private") -> None:
         message = Message(
             message_id=2,
@@ -285,6 +360,10 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
             message=message,
         )
         await self.dispatcher.feed_update(self.bot, Update(update_id=2, callback_query=callback))
+
+    async def choose(self, user_id: int, query: str = "001") -> None:
+        await self.send_text(user_id, "/photo " + query)
+        await self.press(user_id, self.buttons()[0])
 
     async def test_allowed_and_admin_flow(self) -> None:
         self.seed([(1, "001", "Фарба")])
@@ -866,6 +945,352 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         for text in messages:
             self.assertNotIn(" або ", text)
         self.assertEqual(self.c3.requests, [])
+
+
+    async def test_album_two_photos_concurrent_save(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+        )
+        self.assertIn("Отримано 2 фото", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Зберегти фото", "Скасувати"])
+        self.assertEqual(self.c3.posts(), [])
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        posts = self.c3.posts()
+        self.assertEqual(len(posts), 2)
+        self.assertEqual([item[1] for item in posts], ["/api/photos/price/1", "/api/photos/price/1"])
+        self.assertEqual([item[3] for item in posts], [b"one", b"two"])
+        self.assertEqual(posts[0][2]["X-Photo-Gallery-Version"], "")
+        self.assertEqual(posts[1][2]["X-Photo-Gallery-Version"], "rev-1")
+        self.assertEqual(len({item[2]["X-Photo-Request"] for item in posts}), 2)
+        self.assertEqual(len(self.c3.images), 2)
+        self.assertIsNone(flows.get(100))
+        self.assertEqual(flows.receipt(100, 100, "grp-1"), "saved")
+
+    async def test_album_three_photos_stable_order(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a3", 13),
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+        )
+        self.assertIn("Отримано 3 фото", self.last_text())
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 3 фото: 001 Фарба")
+        posts = self.c3.posts()
+        self.assertEqual([item[3] for item in posts], [b"one", b"two", b"three"])
+        self.assertEqual(
+            [item[2]["X-Photo-Gallery-Version"] for item in posts], ["", "rev-1", "rev-2"]
+        )
+        self.assertEqual(len(self.c3.images), 3)
+        self.assertEqual(len({item[2]["X-Photo-Request"] for item in posts}), 3)
+
+    async def test_album_grouped_image_documents(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["d1"] = b"doc-one"
+        self.session.files["d2"] = b"doc-two"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_document(100, "d1", 21),
+            self.send_album_document(100, "d2", 22),
+        )
+        self.assertIn("Отримано 2 фото", self.last_text())
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
+        self.assertEqual([item[3] for item in self.c3.posts()], [b"doc-one", b"doc-two"])
+        self.assertEqual(len(self.c3.images), 2)
+
+    async def test_album_duplicate_update_not_reposted(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+        )
+        await self.send_album_photo(100, "a1", 11)
+        self.assertEqual(len(flows.get(100).album.items), 2)
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
+        await self.send_album_photo(100, "a1", 11)
+        self.assertEqual(len(self.c3.posts()), 2)
+        self.assertEqual(len(self.c3.images), 2)
+        self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
+
+    async def test_album_lost_response_retries_only_unresolved(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+            self.send_album_photo(100, "a3", 13),
+        )
+        self.c3.commit_then_fail = 2
+        await self.send_text(100, "Зберегти фото")
+        self.assertIn("Збережено 1 із 3 фото", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Повторити надсилання", "Скасувати"])
+        self.assertEqual(len(self.c3.images), 2)
+        lost = self.c3.posts()[1][2]["X-Photo-Request"]
+        await self.send_text(100, "Повторити надсилання")
+        self.assertEqual(self.last_text(), "Додано 3 фото: 001 Фарба")
+        self.assertEqual(len(self.c3.images), 3)
+        retried = [item for item in self.c3.posts() if item[2]["X-Photo-Request"] == lost]
+        self.assertEqual(len(retried), 2)
+        self.assertEqual(retried[0][3], retried[1][3])
+        self.assertEqual(len({item[2]["X-Photo-Request"] for item in self.c3.posts()}), 3)
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_conflict_mid_batch_no_rebase(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+            self.send_album_photo(100, "a3", 13),
+        )
+        self.c3.conflict_after = 1
+        await self.send_text(100, "Зберегти фото")
+        self.assertIn("Збережено 1 із 3 фото", self.last_text())
+        self.assertIn("виберіть товар повторно", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(len(self.c3.images), 1)
+        self.assertEqual(len(self.c3.posts()), 2)
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_oversized_member_partial(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a3"] = b"three"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12, size=MAX_UPLOAD_BYTES + 1),
+            self.send_album_photo(100, "a3", 13),
+        )
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Збережено 2 із 3 фото. Фото має бути не більше 20 МБ.")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(len(self.c3.images), 2)
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_different_group_rejected(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        await self.choose(100)
+        await self.send_album_photo(100, "a1", 11, group_id="grp-1")
+        await self.send_album_photo(100, "a2", 12, group_id="grp-2")
+        self.assertIn("Альбом уже збирається для іншого вибору", self.last_text())
+        album = flows.get(100).album
+        self.assertEqual(album.group_id, "grp-1")
+        self.assertEqual(len(album.items), 1)
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 1 фото: 001 Фарба")
+        self.assertEqual(len(self.c3.images), 1)
+
+    async def test_album_cancel_then_old_group_member_ignored(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await self.send_album_photo(100, "a1", 11, group_id="grp-1")
+        await self.send_text(100, "Скасувати")
+        self.assertEqual(self.last_text(), "Скасовано.")
+        self.assertEqual(flows.receipt(100, 100, "grp-1"), "cancelled")
+        await self.choose(100)
+        await self.send_album_photo(100, "a2", 12, group_id="grp-1")
+        self.assertIsNone(flows.get(100).album)
+        self.assertIn("Надішліть фото", self.last_text())
+        self.assertEqual(self.c3.posts(), [])
+
+    async def test_album_revoked_user_cannot_save(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        await self.choose(100)
+        await self.send_album_photo(100, "a1", 11)
+        await self.products_db.set_user_active(user_id=100, is_active=False)
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Доступ заборонено")
+        self.assertEqual(self.c3.posts(), [])
+
+    async def test_album_concurrent_save_and_cancel(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+        )
+        self.session.gate = asyncio.Event()
+        task = asyncio.create_task(self.send_text(100, "Зберегти фото"))
+        await self.wait_locked(100)
+        await self.send_text(100, "Скасувати")
+        self.assertIn("Зачекайте", self.last_text())
+        self.session.gate.set()
+        await task
+        self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
+        self.assertEqual(len(self.c3.images), 2)
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_generation_change_blocks_save(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+        )
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE c3_price_sync SET recovery_generation='gen-other'")
+        await self.send_text(100, "Зберегти фото")
+        self.assertIn("Збережено 0 із 2 фото", self.last_text())
+        self.assertIn("Каталог C3 змінився", self.last_text())
+        self.assertEqual(self.c3.posts(), [])
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_frozen_during_save_rejects_late_member(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three"), ("a4", b"four")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+            self.send_album_photo(100, "a3", 13),
+        )
+        self.c3.commit_then_fail = 2
+        self.session.gate = asyncio.Event()
+        save = asyncio.create_task(self.send_text(100, "Зберегти фото"))
+        await self.wait_locked(100)
+        late = asyncio.create_task(self.send_album_photo(100, "a4", 14))
+        await asyncio.sleep(0.05)
+        self.session.gate.set()
+        await asyncio.gather(save, late)
+        texts = [item.text or "" for item in self.session.sent]
+        self.assertIn("Збережено 1 із 3 фото", texts[-2])
+        self.assertIn("Альбом уже зберігається", texts[-1])
+        album = flows.get(100).album
+        self.assertEqual(sorted(album.items), [11, 12, 13])
+        self.assertTrue(album.started)
+        await self.send_text(100, "Повторити надсилання")
+        self.assertEqual(self.last_text(), "Додано 3 фото: 001 Фарба")
+        self.assertEqual(len(self.c3.images), 3)
+        self.assertEqual(len(self.c3.posts()), 4)
+        self.assertIsNone(flows.get(100))
+
+    async def test_album_missing_version_stops_partial(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+            self.send_album_photo(100, "a3", 13),
+        )
+        self.c3.omit_version = True
+        await self.send_text(100, "Зберегти фото")
+        self.assertIn("Збережено 1 із 3 фото", self.last_text())
+        self.assertIn("не повернув версію галереї", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(len(self.c3.posts()), 1)
+        self.assertEqual(len(self.c3.images), 1)
+        self.assertIsNone(flows.get(100))
+        await self.send_text(100, "/retry")
+        self.assertEqual(self.last_text(), "Немає незавершеного завантаження.")
+        self.assertEqual(len(self.c3.posts()), 1)
+
+    async def test_album_revoked_mid_batch_reports_partial(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        for name, payload in (("a1", b"one"), ("a2", b"two"), ("a3", b"three")):
+            self.session.files[name] = payload
+        await self.choose(100)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11),
+            self.send_album_photo(100, "a2", 12),
+            self.send_album_photo(100, "a3", 13),
+        )
+
+        async def revoke() -> None:
+            await self.products_db.set_user_active(user_id=100, is_active=False)
+
+        self.c3.after_post = revoke
+        await self.send_text(100, "Зберегти фото")
+        self.assertIn("Збережено 1 із 3 фото", self.last_text())
+        self.assertIn("Доступ заборонено", self.last_text())
+        self.assertIsInstance(self.session.sent[-1].reply_markup, ReplyKeyboardRemove)
+        self.assertEqual(len(self.c3.images), 1)
+        self.assertEqual(len(self.c3.posts()), 1)
+        self.assertIsNone(flows.get(100))
+        self.assertEqual(flows._bytes, 0)
+
+    async def test_album_receipt_scoped_per_user_and_chat(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        await self.grant(200)
+        self.env(url=self.base)
+        self.session.files["a1"] = b"one"
+        self.session.files["a2"] = b"two"
+        await self.choose(100)
+        await self.choose(200)
+        await asyncio.gather(
+            self.send_album_photo(100, "a1", 11, group_id="grp-1"),
+            self.send_album_photo(200, "a2", 12, group_id="grp-1"),
+        )
+        await self.send_text(100, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 1 фото: 001 Фарба")
+        self.assertEqual(flows.receipt(100, 100, "grp-1"), "saved")
+        self.assertIsNone(flows.receipt(200, 200, "grp-1"))
+        self.assertIsNotNone(flows.get(200).album)
+        await self.send_text(200, "Зберегти фото")
+        self.assertEqual(self.last_text(), "Додано 1 фото: 001 Фарба")
+        self.assertEqual(len(self.c3.images), 2)
+        self.assertEqual([item[3] for item in self.c3.posts()], [b"one", b"two"])
 
 
 class ConfigureSyncTests(unittest.TestCase):
