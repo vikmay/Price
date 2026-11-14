@@ -14,7 +14,14 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardRemove
 
 from app.db import ProductsDB
-from app.product_photos import flows, register_photo_handlers
+from app.product_photos import (
+    CANCEL_BUTTON,
+    PHOTO_BUTTON,
+    RETRY_BUTTON,
+    flows,
+    main_menu,
+    register_photo_handlers,
+)
 from scripts.import_html import import_file as import_products_from_html
 
 router: Final[Router] = Router(name="handlers")
@@ -180,11 +187,16 @@ def register_handlers(products_db: ProductsDB):
             "Команди:",
             "/start — початок",
             "/help — ця підказка",
-            "/photo <код або назва> — додати фото товару",
-            "/cancel — скасувати вибір або фото",
+            "",
+            "Кнопки:",
+            f"«{PHOTO_BUTTON}» — додати фото товару",
+            f"«{CANCEL_BUTTON}» — скасувати вибір або фото",
+            f"«{RETRY_BUTTON}» — повторити невдале надсилання",
             "",
             "Пошук:",
             "Введіть код або назву товару.",
+            "",
+            "Сумісні команди (необов'язкові): /photo, /cancel, /retry",
             "",
         ]
 
@@ -323,7 +335,13 @@ def register_handlers(products_db: ProductsDB):
         if not flows.cancel(uid):
             await _answer(message, "Зачекайте: фото вже надсилається. Спробуйте /start пізніше.")
             return
-        await _answer(message, "Введіть код або назву товару. /photo <код або назва> — додати фото, /cancel — скасувати.")
+        if message.chat.type != "private":
+            await _answer(message, "Введіть код або назву товару для пошуку цін.")
+            return
+        await message.answer(
+            "Введіть код або назву товару для пошуку цін або натисніть «Додати фото».",
+            reply_markup=main_menu(),
+        )
 
     @router.message(Command("reload"))
     async def _reload(message: Message) -> None:
@@ -390,6 +408,8 @@ def register_handlers(products_db: ProductsDB):
         text = (message.text or "").strip()
         if not text or text.startswith("/"):
             return
+        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON):
+            return
 
         uid = message.from_user.id
         role_tag = await _get_access_role_tag(uid)
@@ -406,10 +426,11 @@ def register_handlers(products_db: ProductsDB):
 
         is_admin = role_tag == "admin" and effective_admin.get(uid, True)
         key = _cache_key(text, is_admin)
+        menu = main_menu() if message.chat.type == "private" else reply_remove
 
         cached = cache.get(key)
         if cached is not None:
-            await message.answer(cached, reply_markup=reply_remove, parse_mode="HTML")
+            await message.answer(cached, reply_markup=menu, parse_mode="HTML")
             return
 
         try:
@@ -432,7 +453,7 @@ def register_handlers(products_db: ProductsDB):
 
             if generation == cache.generation:
                 cache.set(key, response)
-            await message.answer(response, reply_markup=reply_remove, parse_mode="HTML")
+            await message.answer(response, reply_markup=menu, parse_mode="HTML")
 
         except Exception:
             await _answer(message, "Помилка під час пошуку. Спробуйте ще раз.")

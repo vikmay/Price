@@ -13,7 +13,17 @@ from unittest.mock import patch
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerCallbackQuery, GetFile, SendMessage
-from aiogram.types import CallbackQuery, Chat, Document, File, Message, PhotoSize, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    Document,
+    File,
+    Message,
+    PhotoSize,
+    ReplyKeyboardRemove,
+    Update,
+    User,
+)
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -27,6 +37,7 @@ from app.product_photos import (
     flows,
     resolve_base_url,
 )
+from scripts.configure_c3_sync import configure
 
 KEY = "photo-test-" + "k" * 40
 SOURCE = "a03f57b6-4670-4cee-afaf-8dbb105ef901"
@@ -210,6 +221,10 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
     def buttons(self) -> list[str]:
         markup = self.session.sent[-1].reply_markup
         return [row[0].callback_data for row in markup.inline_keyboard]
+
+    def reply_labels(self) -> list[str]:
+        markup = self.session.sent[-1].reply_markup
+        return [button.text for row in markup.keyboard for button in row]
 
     async def send_text(self, user_id: int, text: str, chat_type: str = "private", chat_id: int | None = None) -> None:
         message = Message(
@@ -398,7 +413,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.press(100, self.buttons()[0])
         self.c3.status = 503
         await self.send_photo(100)
-        self.assertIn("/retry", self.last_text())
+        self.assertIn("Повторити надсилання", self.last_text())
         self.assertIsNotNone(flows.get(100).pending)
         self.c3.status = 200
         await self.send_text(100, "/retry")
@@ -418,7 +433,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.press(100, self.buttons()[0])
         self.c3.status = 409
         await self.send_photo(100)
-        self.assertIn("Виберіть товар повторно", self.last_text())
+        self.assertIn("виберіть товар повторно", self.last_text())
         self.assertIsNone(flows.get(100).pending)
         self.assertIsNone(flows.get(100).chosen)
         await self.send_text(100, "/retry")
@@ -443,14 +458,12 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.grant(100)
         self.env(url=None)
         await self.send_text(100, "/photo 001")
-        await self.press(100, self.buttons()[0])
-        self.assertIn("Фото недоступні", self.last_text())
+        self.assertEqual(self.last_text(), "Фото недоступні: не задано PRICE_C3_URL на сервері бота.")
         self.env(url=self.base)
         self.seed([(1, "001", "Фарба")], generation=None)
         await self.grant(100)
         await self.send_text(100, "/photo 001")
-        await self.press(100, self.buttons()[0])
-        self.assertIn("Фото недоступні", self.last_text())
+        self.assertIn("немає покоління відновлення C3", self.last_text())
         self.assertEqual(self.c3.requests, [])
 
     async def test_cancel_clears_only_current_user(self) -> None:
@@ -570,7 +583,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.c3.gallery_version = "rev-2"
         self.c3.status = 409
         await self.send_photo(100)
-        self.assertIn("Виберіть товар повторно", self.last_text())
+        self.assertIn("виберіть товар повторно", self.last_text())
         self.assertEqual(self.c3.posts()[0][2]["X-Photo-Gallery-Version"], "rev-1")
         self.assertIsNone(flows.get(100).chosen)
         self.assertIsNone(flows.get(100).pending)
@@ -702,12 +715,12 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.press(100, self.buttons()[0])
         self.c3.payload = b'{"success": false}'
         await self.send_photo(100)
-        self.assertIn("/retry", self.last_text())
+        self.assertIn("Повторити надсилання", self.last_text())
         self.assertIsNotNone(flows.get(100).pending)
         for payload in (b"[1,2]", b'{"success": true}' + b" " * (1024 * 1024)):
             self.c3.payload = payload
             await self.send_text(100, "/retry")
-            self.assertIn("/retry", self.last_text())
+            self.assertIn("Повторити надсилання", self.last_text())
             self.assertIsNotNone(flows.get(100).pending)
         self.c3.payload = None
         await self.send_text(100, "/retry")
@@ -726,6 +739,181 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         label = markup.inline_keyboard[0][0].text
         self.assertLessEqual(len(label), 60)
         self.assertTrue(label.endswith("· ID 1"), label)
+
+
+    async def test_start_button_flow_without_slash(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["photo-1"] = b"button-bytes"
+        await self.send_text(100, "/start")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertIn("натисніть «Додати фото»", self.last_text())
+        await self.send_text(100, "Додати фото")
+        self.assertIn("Введіть код або назву товару для фото", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Скасувати"])
+        await self.send_text(100, "001")
+        self.assertIn("Виберіть товар", self.last_text())
+        await self.press(100, self.buttons()[0])
+        self.assertIn("Надішліть фото", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Скасувати"])
+        await self.send_photo(100)
+        self.assertEqual(self.last_text(), "Фото додано: 001 Фарба")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(len(self.c3.posts()), 1)
+
+    async def test_price_search_keeps_main_menu(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        await self.send_text(100, "Фарба")
+        self.assertIn("Фарба", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        await self.send_text(100, "Фарба")
+        self.assertIn("Фарба", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+
+    async def test_cancel_and_retry_buttons_keep_pending_uuid(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        self.session.files["photo-1"] = b"retry-bytes"
+        await self.send_text(100, "Додати фото")
+        await self.send_text(100, "001")
+        await self.press(100, self.buttons()[0])
+        self.c3.status = 503
+        await self.send_photo(100)
+        self.assertIn("Повторити надсилання", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Повторити надсилання", "Скасувати"])
+        pending = flows.get(100).pending.request_id
+        self.c3.status = 200
+        await self.send_text(100, "Повторити надсилання")
+        self.assertEqual(self.last_text(), "Фото додано: 001 Фарба")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        posts = self.c3.posts()
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0][2]["X-Photo-Request"], pending)
+        self.assertEqual(posts[0][2]["X-Photo-Request"], posts[1][2]["X-Photo-Request"])
+        self.assertEqual(posts[0][3], posts[1][3])
+
+    async def test_cancel_button_restores_main_menu(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        await self.send_text(100, "Додати фото")
+        await self.send_text(100, "Скасувати")
+        self.assertEqual(self.last_text(), "Скасовано.")
+        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertIsNone(flows.get(100))
+        await self.send_text(100, "Скасувати")
+        self.assertEqual(self.last_text(), "Скасовано.")
+        self.assertEqual(self.c3.requests, [])
+
+    async def test_buttons_respect_access_and_private_chat(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        self.env(url=self.base)
+        await self.send_text(300, "Додати фото")
+        self.assertEqual(self.last_text(), "Доступ заборонено")
+        self.assertIsInstance(self.session.sent[-1].reply_markup, ReplyKeyboardRemove)
+        await self.grant(100)
+        await self.send_text(100, "Додати фото", chat_type="group")
+        self.assertIn("лише в приватному чаті", self.last_text())
+        await self.send_text(100, "Скасувати", chat_type="group")
+        self.assertIn("лише в приватному чаті", self.last_text())
+        await self.send_text(100, "Повторити надсилання", chat_type="group")
+        self.assertIn("лише в приватному чаті", self.last_text())
+        await self.send_text(100, "/start", chat_type="group")
+        self.assertIsInstance(self.session.sent[-1].reply_markup, ReplyKeyboardRemove)
+        self.assertEqual(self.c3.requests, [])
+
+    async def test_setup_diagnostics_are_specific(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        messages: list[str] = []
+        self.env(url=None)
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.env(url="http://c3.example.com")
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.env(url=self.base, key=None)
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.env(url=self.base, key="short")
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.env(url=self.base)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE c3_price_sync SET source=''")
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.seed([(1, "001", "Фарба")], generation=None)
+        await self.grant(100)
+        await self.send_text(100, "/photo 001")
+        messages.append(self.last_text())
+        self.assertEqual(messages[0], "Фото недоступні: не задано PRICE_C3_URL на сервері бота.")
+        self.assertEqual(
+            messages[1],
+            "Фото недоступні: PRICE_C3_URL має некоректний формат (потрібен HTTPS без облікових даних).",
+        )
+        self.assertEqual(messages[2], "Фото недоступні: не задано PRICE_SYNC_KEY на сервері бота.")
+        self.assertIn("PRICE_SYNC_KEY має некоректний формат", messages[3])
+        self.assertEqual(
+            messages[4],
+            "Фото недоступні: каталог Price не має джерела C3. Потрібен новий повний прайс із C3 Trade.",
+        )
+        self.assertIn("немає покоління відновлення C3", messages[5])
+        for text in messages:
+            self.assertNotIn(" або ", text)
+        self.assertEqual(self.c3.requests, [])
+
+
+class ConfigureSyncTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.path = Path(self.tempdir.name) / ".env"
+
+    def read(self) -> str:
+        return self.path.read_text(encoding="utf-8")
+
+    def test_url_forwarded_and_preserved(self) -> None:
+        self.path.write_text("TELEGRAM_BOT_TOKEN=1:x\n", encoding="utf-8")
+        key = configure(self.path, "k" * 40, "https://c3.example.com/")
+        self.assertIn("PRICE_SYNC_KEY=" + key, self.read())
+        self.assertIn("PRICE_C3_URL=https://c3.example.com", self.read())
+        self.assertIn("TELEGRAM_BOT_TOKEN=1:x", self.read())
+        configure(self.path, None, None)
+        self.assertIn("PRICE_C3_URL=https://c3.example.com", self.read())
+
+    def test_invalid_url_rejected_before_write(self) -> None:
+        self.path.write_text("PRICE_SYNC_KEY=" + "k" * 40 + "\n", encoding="utf-8")
+        before = self.read()
+        for bad in (
+            "http://c3.example.com",
+            "https://user:pass@c3.example.com",
+            "https://c3.example.com/?a=1",
+            "ftp://c3.example.com",
+        ):
+            with self.assertRaises(ValueError):
+                configure(self.path, None, bad)
+            self.assertEqual(self.read(), before)
+        configure(self.path, None, "http://127.0.0.1:8082")
+        self.assertIn("PRICE_C3_URL=http://127.0.0.1:8082", self.read())
+
+    def test_key_only_behavior_preserved(self) -> None:
+        key = configure(self.path, None, None)
+        self.assertIn("PRICE_SYNC_KEY=" + key, self.read())
+        self.assertNotIn("PRICE_C3_URL", self.read())
+        configure(self.path, None, None)
+        self.assertIn("PRICE_SYNC_KEY=" + key, self.read())
+
+    def test_deploy_forwards_url_variable(self) -> None:
+        workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PRICE_C3_URL: ${{ vars.PRICE_C3_URL }}", workflow)
+        self.assertIn("envs: PRICE_SYNC_KEY,PRICE_C3_URL", workflow)
 
 
 if __name__ == "__main__":

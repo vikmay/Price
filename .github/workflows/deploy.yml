@@ -19,12 +19,13 @@ jobs:
 
               env:
                   PRICE_SYNC_KEY: ${{ secrets.PRICE_SYNC_KEY }}
+                  PRICE_C3_URL: ${{ vars.PRICE_C3_URL }}
 
               with:
                   host: ${{ secrets.VM_HOST }}
                   username: ${{ secrets.VM_USER }}
                   key: ${{ secrets.VM_SSH_KEY }}
-                  envs: PRICE_SYNC_KEY
+                  envs: PRICE_SYNC_KEY,PRICE_C3_URL
 
                   script: |
                       set -euo pipefail
