@@ -22,6 +22,9 @@ def ensure_schema(db_path: str) -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS c3_price_sync (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1), source TEXT NOT NULL,
             sequence INTEGER NOT NULL, updated_at TEXT NOT NULL)""")
+        sync_columns = {row[1] for row in conn.execute("PRAGMA table_info(c3_price_sync)")}
+        if "recovery_generation" not in sync_columns:
+            conn.execute("ALTER TABLE c3_price_sync ADD COLUMN recovery_generation TEXT")
 
 
 def validate_payload(payload: object) -> dict:
@@ -35,6 +38,10 @@ def validate_payload(payload: object) -> dict:
         raise ValueError("Invalid sequence")
     if type(payload.get("full")) is not bool:
         raise ValueError("Invalid full flag")
+    generation = payload.get("recoveryGeneration")
+    if generation is not None and (not isinstance(generation, str) or len(generation) > 200
+                                   or any(ord(c) < 32 or ord(c) == 127 for c in generation)):
+        raise ValueError("Invalid recovery generation")
     products = payload.get("products")
     if not isinstance(products, list) or len(products) > 200_000:
         raise ValueError("Invalid products")
@@ -87,9 +94,10 @@ def apply_batch(db_path: str, payload: object) -> bool:
                 purchase_price=excluded.purchase_price,updated_at=excluded.updated_at""",
                 (product["id"], product["code"], product["name"], product["name"].casefold(),
                  product["price"], product.get("purchase_price"), now))
-        conn.execute("""INSERT INTO c3_price_sync VALUES(1,?,?,?) ON CONFLICT(singleton)
-            DO UPDATE SET source=excluded.source,sequence=excluded.sequence,updated_at=excluded.updated_at""",
-            (data["source"], data["sequence"], now))
+        conn.execute("""INSERT INTO c3_price_sync VALUES(1,?,?,?,?) ON CONFLICT(singleton)
+            DO UPDATE SET source=excluded.source,sequence=excluded.sequence,updated_at=excluded.updated_at,
+                recovery_generation=excluded.recovery_generation""",
+            (data["source"], data["sequence"], now, data.get("recoveryGeneration")))
     return True
 
 

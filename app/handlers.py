@@ -14,6 +14,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardRemove
 
 from app.db import ProductsDB
+from app.product_photos import flows, register_photo_handlers
 from scripts.import_html import import_file as import_products_from_html
 
 router: Final[Router] = Router(name="handlers")
@@ -179,6 +180,8 @@ def register_handlers(products_db: ProductsDB):
             "Команди:",
             "/start — початок",
             "/help — ця підказка",
+            "/photo <код або назва> — додати фото товару",
+            "/cancel — скасувати вибір або фото",
             "",
             "Пошук:",
             "Введіть код або назву товару.",
@@ -317,7 +320,10 @@ def register_handlers(products_db: ProductsDB):
         uid = message.from_user.id
         role_tag = await _get_access_role_tag(uid)
         effective_admin[uid] = (role_tag == "admin")
-        await _answer(message, "Введіть код або назву товару.")
+        if not flows.cancel(uid):
+            await _answer(message, "Зачекайте: фото вже надсилається. Спробуйте /start пізніше.")
+            return
+        await _answer(message, "Введіть код або назву товару. /photo <код або назва> — додати фото, /cancel — скасувати.")
 
     @router.message(Command("reload"))
     async def _reload(message: Message) -> None:
@@ -325,6 +331,8 @@ def register_handlers(products_db: ProductsDB):
             return
         cache.clear()
         await _answer(message, "Ок. Кеш очищено.")
+
+    register_photo_handlers(router, products_db, _get_access_role_tag)
 
     @router.message(F.document)
     async def _document_import(message: Message) -> None:

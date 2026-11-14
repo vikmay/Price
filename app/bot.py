@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher
 from app.config import load_settings
 from app.db import ProductsDB, connect
 from app.handlers import register_handlers, router
-from app.price_sync import start_receiver
+from app.price_sync import ensure_schema, start_receiver
 
 
 def setup_logging() -> None:
@@ -49,6 +49,7 @@ async def main() -> None:
     if os.getenv("BOT_SMOKE") == "1":
         db_path = os.getenv("DB_PATH", os.path.join("data", "products.db"))
         connect(db_path)
+        ensure_schema(db_path)
         products_db = ProductsDB(db_path)
         await _bootstrap_admin_if_needed(products_db)
         register_handlers(products_db)
@@ -58,6 +59,7 @@ async def main() -> None:
     settings = load_settings()
 
     connect(settings.DB_PATH)
+    ensure_schema(settings.DB_PATH)
 
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
