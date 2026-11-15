@@ -16,7 +16,6 @@ from aiogram.types import Message, ReplyKeyboardRemove
 from app.db import ProductsDB
 from app.product_photos import (
     CANCEL_BUTTON,
-    BARCODE_BUTTON,
     PHOTO_BUTTON,
     RETRY_BUTTON,
     SAVE_BUTTON,
@@ -192,14 +191,13 @@ def register_handlers(products_db: ProductsDB):
             "",
             "Кнопки:",
             f"«{PHOTO_BUTTON}» — додати фото товару",
-            f"«{BARCODE_BUTTON}» — додати штрихкод товару",
             f"«{CANCEL_BUTTON}» — скасувати вибір або фото",
             f"«{RETRY_BUTTON}» — повторити невдале надсилання",
             "",
             "Пошук:",
             "Введіть код або назву товару.",
             "",
-            "Сумісні команди (необов'язкові): /photo, /barcode, /cancel, /retry",
+            "Сумісні команди (необов'язкові): /photo, /cancel, /retry",
             "",
         ]
 
@@ -411,7 +409,7 @@ def register_handlers(products_db: ProductsDB):
         text = (message.text or "").strip()
         if not text or text.startswith("/"):
             return
-        if text in (PHOTO_BUTTON, BARCODE_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
+        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
             return
 
         uid = message.from_user.id

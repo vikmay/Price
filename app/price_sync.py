@@ -122,8 +122,6 @@ def create_app(db_path: str, key: str, invalidate_cache) -> web.Application:
                                  headers={"Cache-Control": "no-store"})
 
     app.router.add_post("/api/c3/prices", receive)
-    from app.webapp import add_routes
-    add_routes(app)
     return app
 
 
