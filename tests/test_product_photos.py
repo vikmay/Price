@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import asyncio
 import os
 import sqlite3
@@ -108,6 +110,9 @@ class FakeC3:
         self.app = web.Application()
         self.app.router.add_get("/api/photos/price/{id}", self.get_photo)
         self.app.router.add_post("/api/photos/price/{id}", self.post_photo)
+        self.app.router.add_post("/api/barcodes/price/{id}", self.post_barcode)
+        self.barcode_status = 200
+        self.barcodes: list[dict] = []
         self.server = TestServer(self.app)
 
     async def start(self) -> str:
@@ -169,6 +174,14 @@ class FakeC3:
         return web.json_response(
             {"success": True, "photo": {"version": existing["version"], "galleryVersion": existing["version"]}}
         )
+
+    async def post_barcode(self, request: web.Request) -> web.Response:
+        body = await request.read()
+        self.requests.append(("BARCODE", request.path, dict(request.headers), body))
+        if self.barcode_status != 200:
+            return web.json_response({"success": False, "message": "Штрихкод зайнятий"}, status=self.barcode_status)
+        self.barcodes.append(json.loads(body))
+        return web.json_response({"success": True})
 
     def posts(self) -> list[tuple[str, str, dict, bytes]]:
         return [item for item in self.requests if item[0] == "POST"]
@@ -826,7 +839,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.env(url=self.base)
         self.session.files["photo-1"] = b"button-bytes"
         await self.send_text(100, "/start")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertIn("натисніть «Додати фото»", self.last_text())
         await self.send_text(100, "Додати фото")
         self.assertIn("Введіть код або назву товару для фото", self.last_text())
@@ -838,8 +851,47 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reply_labels(), ["Скасувати"])
         await self.send_photo(100)
         self.assertEqual(self.last_text(), "Фото додано: 001 Фарба")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertEqual(len(self.c3.posts()), 1)
+
+    async def test_barcode_button_flow(self) -> None:
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        await self.send_text(100, "Додати штрихкод")
+        self.assertIn("для штрихкоду", self.last_text())
+        self.assertEqual(self.reply_labels(), ["Скасувати"])
+        await self.send_text(100, "001")
+        await self.press(100, self.buttons()[0])
+        self.assertIn("Введіть штрихкод", self.last_text())
+        await self.send_text(100, "bad code")
+        self.assertIn("Введіть ще раз", self.last_text())
+        self.assertEqual(len(self.c3.barcodes), 0)
+        self.c3.barcode_status = 422
+        await self.send_text(100, "4820000000012")
+        self.assertIn("Штрихкод зайнятий", self.last_text())
+        self.c3.barcode_status = 200
+        await self.send_text(100, "4820000000012")
+        self.assertEqual(self.last_text(), "Штрихкод 4820000000012 додано: 001 Фарба")
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
+        self.assertEqual(self.c3.barcodes, [{"barcode": "4820000000012", "identity": IDENTITY}])
+
+    async def test_scan_submit_saves_barcode(self) -> None:
+        from app.product_photos import flows, scan_hooks
+        self.seed([(1, "001", "Фарба")])
+        await self.grant(100)
+        self.env(url=self.base)
+        await self.send_text(100, "Додати штрихкод")
+        await self.send_text(100, "001")
+        await self.press(100, self.buttons()[0])
+        flow = flows.get(100)
+        token = flow.chosen.token
+        self.assertEqual(await scan_hooks["submit"](100, "wrongtoken1", "123"), ("reset", "Сеанс сканування завершено. Поверніться в чат і натисніть «Додати штрихкод»."))
+        self.assertEqual(await scan_hooks["submit"](100, token, "bad code"), ("retry", "Штрихкод: до 80 літер, цифр або символів - . _, без пробілів. Введіть ще раз."))
+        outcome, _ = await scan_hooks["submit"](100, token, "4820000000029")
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(self.c3.barcodes, [{"barcode": "4820000000029", "identity": IDENTITY}])
+        self.assertEqual((await scan_hooks["submit"](100, token, "4820000000029"))[0], "reset")
 
     async def test_price_search_keeps_main_menu(self) -> None:
         self.seed([(1, "001", "Фарба")])
@@ -847,10 +899,10 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.env(url=self.base)
         await self.send_text(100, "Фарба")
         self.assertIn("Фарба", self.last_text())
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         await self.send_text(100, "Фарба")
         self.assertIn("Фарба", self.last_text())
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
 
     async def test_cancel_and_retry_buttons_keep_pending_uuid(self) -> None:
         self.seed([(1, "001", "Фарба")])
@@ -868,7 +920,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.c3.status = 200
         await self.send_text(100, "Повторити надсилання")
         self.assertEqual(self.last_text(), "Фото додано: 001 Фарба")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         posts = self.c3.posts()
         self.assertEqual(len(posts), 2)
         self.assertEqual(posts[0][2]["X-Photo-Request"], pending)
@@ -882,7 +934,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.send_text(100, "Додати фото")
         await self.send_text(100, "Скасувати")
         self.assertEqual(self.last_text(), "Скасовано.")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertIsNone(flows.get(100))
         await self.send_text(100, "Скасувати")
         self.assertEqual(self.last_text(), "Скасовано.")
@@ -963,7 +1015,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.c3.posts(), [])
         await self.send_text(100, "Зберегти фото")
         self.assertEqual(self.last_text(), "Додано 2 фото: 001 Фарба")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         posts = self.c3.posts()
         self.assertEqual(len(posts), 2)
         self.assertEqual([item[1] for item in posts], ["/api/photos/price/1", "/api/photos/price/1"])
@@ -1078,7 +1130,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.send_text(100, "Зберегти фото")
         self.assertIn("Збережено 1 із 3 фото", self.last_text())
         self.assertIn("виберіть товар повторно", self.last_text())
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertEqual(len(self.c3.images), 1)
         self.assertEqual(len(self.c3.posts()), 2)
         self.assertIsNone(flows.get(100))
@@ -1097,7 +1149,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.send_text(100, "Зберегти фото")
         self.assertEqual(self.last_text(), "Збережено 2 із 3 фото. Фото має бути не більше 20 МБ.")
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertEqual(len(self.c3.images), 2)
         self.assertIsNone(flows.get(100))
 
@@ -1235,7 +1287,7 @@ class PhotoFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.send_text(100, "Зберегти фото")
         self.assertIn("Збережено 1 із 3 фото", self.last_text())
         self.assertIn("не повернув версію галереї", self.last_text())
-        self.assertEqual(self.reply_labels(), ["Додати фото"])
+        self.assertEqual(self.reply_labels(), ["Додати фото", "Додати штрихкод"])
         self.assertEqual(len(self.c3.posts()), 1)
         self.assertEqual(len(self.c3.images), 1)
         self.assertIsNone(flows.get(100))

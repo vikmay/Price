@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -22,6 +23,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    WebAppInfo,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -39,6 +41,8 @@ CALLBACK_PREFIX: Final = "pp:"
 IMAGE_MIME: Final = ("image/jpeg", "image/png", "image/webp")
 IMAGE_SUFFIX: Final = (".jpg", ".jpeg", ".png", ".webp")
 PHOTO_BUTTON: Final = "Додати фото"
+BARCODE_BUTTON: Final = "Додати штрихкод"
+BARCODE_CHARS: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._")
 CANCEL_BUTTON: Final = "Скасувати"
 RETRY_BUTTON: Final = "Повторити надсилання"
 SAVE_BUTTON: Final = "Зберегти фото"
@@ -48,7 +52,9 @@ MAX_RECEIPTS: Final = 500
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=PHOTO_BUTTON)]], resize_keyboard=True, is_persistent=True
+        keyboard=[[KeyboardButton(text=PHOTO_BUTTON), KeyboardButton(text=BARCODE_BUTTON)]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -239,6 +245,14 @@ class PhotoClient:
             raise PhotoUploadError("Сервер C3 Trade перенаправляє запит. Перевірте адресу.", status=status)
         if status in (401, 403):
             raise PhotoUploadError("C3 Trade відхилив доступ бота. Зверніться до адміністратора.", status=status)
+        if status in (400, 422) and "/api/barcodes/" in path:
+            try:
+                detail = json.loads(body.decode("utf-8")).get("message")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                detail = None
+            raise PhotoUploadError(
+                detail if isinstance(detail, str) and detail else "C3 Trade не прийняв штрихкод.", status=status
+            )
         if status == 404:
             raise PhotoUploadError("Товар не знайдено на сервері C3 Trade.", status=status)
         if status == 409:
@@ -302,6 +316,15 @@ class PhotoClient:
             raise PhotoUploadError(
                 "C3 Trade не підтвердив збереження фото. Натисніть «Повторити надсилання».", retryable=True
             )
+        return result
+
+
+    async def assign_barcode(self, c3_id: int, identity: str, barcode: str) -> dict:
+        extra = {"Content-Type": "application/json"}
+        payload = json.dumps({"barcode": barcode, "identity": identity}).encode("utf-8")
+        result = await self._send("POST", f"/api/barcodes/price/{c3_id}", data=payload, extra=extra)
+        if result.get("success") is not True:
+            raise PhotoUploadError("C3 Trade не підтвердив збереження штрихкоду. Спробуйте ще раз.", retryable=True)
         return result
 
 
@@ -369,6 +392,8 @@ class Flow:
     user_id: int
     chat_id: int
     mode: str = ""
+    kind: str = "photo"
+    bot: object = None
     selections: dict[str, Selection] = field(default_factory=dict)
     chosen: Selection | None = None
     pending: Pending | None = None
@@ -490,6 +515,7 @@ class PhotoFlows:
 
 
 flows: Final[PhotoFlows] = PhotoFlows()
+scan_hooks: dict = {}
 
 
 def register_photo_handlers(
@@ -587,7 +613,8 @@ def register_photo_handlers(
         flow.mode = "select"
         flow.expires_at = now + FLOW_TTL
         await message.answer(
-            "Виберіть товар для фото:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            "Виберіть товар для штрихкоду:" if flow.kind == "barcode" else "Виберіть товар для фото:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
 
     async def _download(message: Message, file_id: str) -> bytes:
@@ -891,6 +918,105 @@ def register_photo_handlers(
             _pending_menu(),
         )
 
+    async def _apply_barcode(flow: Flow, text: str) -> tuple[str, str, bool, object]:
+        selection = flow.chosen
+        if selection is None or selection.expires_at <= time.time():
+            flow.chosen = None
+            flow.mode = "search"
+            return "reset", "Вибір товару застарів. Натисніть «Додати штрихкод».", False, main_menu()
+        code = text.strip()
+        if not code or len(code) > 80 or any(c not in BARCODE_CHARS for c in code):
+            return (
+                "retry",
+                "Штрихкод: до 80 літер, цифр або символів - . _, без пробілів. Введіть ще раз.",
+                False,
+                _step_menu(),
+            )
+        product = selection.product
+        try:
+            loop = asyncio.get_running_loop()
+            current = await loop.run_in_executor(None, _product_sync, products_db.db_path, product.c3_id)
+        except Exception:
+            return "retry", "Помилка читання каталогу. Введіть штрихкод ще раз.", False, _step_menu()
+        if not _current(flow, selection):
+            return "stale", "Вибір товару змінився.", False, None
+        if current is None or current.source != product.source or current.generation != product.generation:
+            flow.chosen = None
+            flow.mode = "search"
+            return (
+                "reset",
+                "Каталог C3 змінився. Натисніть «Додати штрихкод» і виберіть товар повторно.",
+                False,
+                main_menu(),
+            )
+        client = _client(flow, product)
+        if client is None:
+            return "reset", _diagnose(product), False, main_menu()
+        try:
+            await client.assign_barcode(product.c3_id, selection.identity, code)
+        except PhotoUploadError as ex:
+            if not _current(flow, selection):
+                return "stale", "Вибір товару змінився.", False, None
+            if ex.conflict:
+                flow.chosen = None
+                flow.mode = "search"
+                return "reset", ex.message, False, main_menu()
+            return "retry", ex.message + " Введіть штрихкод ще раз або натисніть «Скасувати».", False, _step_menu()
+        if not _current(flow, selection):
+            return "stale", "Вибір товару змінився.", False, None
+        flows.clear(flow.user_id, "saved")
+        return (
+            "ok",
+            f"Штрихкод {html.escape(code)} додано: {html.escape(product.code)} {html.escape(product.name)}",
+            True,
+            main_menu(),
+        )
+
+    async def _save_barcode(message: Message, flow: Flow, text: str) -> None:
+        outcome, reply, is_html, markup = await _apply_barcode(flow, text)
+        if outcome == "stale":
+            return
+        if is_html:
+            await message.answer(reply, parse_mode="HTML", reply_markup=markup)
+        else:
+            await _answer(message, reply, markup)
+
+    async def _scan_submit(user_id: int, token: str, code: str) -> tuple[str, str]:
+        if (await role_of(user_id)) is None:
+            return "denied", "Доступ заборонено"
+        flow = flows.get(user_id)
+        selection = flow.chosen if flow else None
+        if (
+            flow is None
+            or flow.mode != "barcode"
+            or selection is None
+            or selection.token != token
+            or flow.bot is None
+        ):
+            return "reset", "Сеанс сканування завершено. Поверніться в чат і натисніть «Додати штрихкод»."
+        if not await _hold(flow.lock):
+            return "retry", "Зачекайте: штрихкод ще зберігається."
+        try:
+            if flows.get(user_id) is not flow or flow.chosen is not selection:
+                return "reset", "Сеанс сканування завершено."
+            outcome, reply, is_html, markup = await _apply_barcode(flow, code)
+            if outcome == "stale":
+                return "reset", "Сеанс сканування завершено."
+            if outcome != "retry":
+                try:
+                    await flow.bot.send_message(
+                        flow.chat_id, reply, parse_mode="HTML" if is_html else None,
+                        reply_markup=markup if markup is not None else reply_remove,
+                    )
+                except Exception:
+                    pass
+            plain = html.unescape(re.sub(r"<[^>]+>", "", reply)) if is_html else reply
+            return outcome, plain
+        finally:
+            flow.lock.release()
+
+    scan_hooks["submit"] = _scan_submit
+
     @router.message(_CommandOrButton("save", SAVE_BUTTON))
     async def _save(message: Message) -> None:
         if message.chat.type != "private":
@@ -916,6 +1042,13 @@ def register_photo_handlers(
 
     @router.message(_CommandOrButton("photo", PHOTO_BUTTON))
     async def _photo_command(message: Message, command: CommandObject | None = None) -> None:
+        await _begin(message, command, "photo")
+
+    @router.message(_CommandOrButton("barcode", BARCODE_BUTTON))
+    async def _barcode_command(message: Message, command: CommandObject | None = None) -> None:
+        await _begin(message, command, "barcode")
+
+    async def _begin(message: Message, command: CommandObject | None, kind: str) -> None:
         if message.chat.type != "private":
             await _answer(message, "Фото можна додавати лише в приватному чаті.")
             return
@@ -939,6 +1072,7 @@ def register_photo_handlers(
                 return
             flows.drop_pending(flow)
             flow.mode = "search"
+            flow.kind = kind
             flow.chosen = None
             flow.selections.clear()
             flow.expires_at = time.time() + FLOW_TTL
@@ -946,9 +1080,10 @@ def register_photo_handlers(
             if query:
                 await _search(message, flow, query)
                 return
+            subject = "штрихкоду" if kind == "barcode" else "фото"
             await _answer(
                 message,
-                "Введіть код або назву товару для фото. Натисніть «Скасувати», щоб скасувати.",
+                f"Введіть код або назву товару для {subject}. Натисніть «Скасувати», щоб скасувати.",
                 _step_menu(),
             )
         finally:
@@ -1045,8 +1180,29 @@ def register_photo_handlers(
             )
             flow.selections[chosen.token] = chosen
             flow.chosen = chosen
-            flow.mode = "upload"
             flow.expires_at = time.time() + FLOW_TTL
+            if flow.kind == "barcode":
+                flow.mode = "barcode"
+                await _answer(
+                    message,
+                    f"Введіть штрихкод товару {product.code} {product.name} (до 80 літер, цифр або символів - . _,"
+                    f" без пробілів). Натисніть «{CANCEL_BUTTON}», щоб скасувати.",
+                    _step_menu(),
+                )
+                flow.bot = message.bot
+                base = (os.getenv("PRICE_WEBAPP_URL") or "").strip().rstrip("/")
+                if validate_base_url(base) is not None and base.startswith("https://"):
+                    await message.answer(
+                        "Або проскануйте штрихкод камерою телефона:",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(
+                                text="Сканувати камерою",
+                                web_app=WebAppInfo(url=f"{base}/scan?t={chosen.token}"),
+                            )
+                        ]]),
+                    )
+                return
+            flow.mode = "upload"
             await _answer(
                 message,
                 f"Надішліть фото товару {product.code} {product.name}, прикріпивши його через Telegram."
@@ -1069,6 +1225,9 @@ def register_photo_handlers(
             raise SkipHandler
         if (await role_of(message.from_user.id)) is None:
             await _answer(message, "Доступ заборонено")
+            return
+        if flow.mode == "barcode":
+            await _answer(message, "Очікується штрихкод текстом. Введіть його або натисніть «Скасувати».", _step_menu())
             return
         photo = message.photo[-1]
         if group_id:
@@ -1094,6 +1253,9 @@ def register_photo_handlers(
         if (await role_of(message.from_user.id)) is None:
             await _answer(message, "Доступ заборонено")
             return
+        if flow.mode == "barcode":
+            await _answer(message, "Очікується штрихкод текстом. Введіть його або натисніть «Скасувати».", _step_menu())
+            return
         if group_id:
             await _collect(message, flow, document.file_id, document.file_size, group_id)
             return
@@ -1104,10 +1266,10 @@ def register_photo_handlers(
         text = (message.text or "").strip()
         if not text or text.startswith("/") or message.chat.type != "private":
             raise SkipHandler
-        if text in (PHOTO_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
+        if text in (PHOTO_BUTTON, BARCODE_BUTTON, CANCEL_BUTTON, RETRY_BUTTON, SAVE_BUTTON):
             raise SkipHandler
         flow = flows.get(message.from_user.id)
-        if flow is None or flow.mode != "search":
+        if flow is None or flow.mode not in ("search", "barcode"):
             raise SkipHandler
         if (await role_of(message.from_user.id)) is None:
             await _answer(message, "Доступ заборонено")
@@ -1116,7 +1278,10 @@ def register_photo_handlers(
             await _answer(message, "Зачекайте: фото вже надсилається.")
             return
         try:
-            if flows.get(message.from_user.id) is not flow or flow.mode != "search":
+            if flows.get(message.from_user.id) is not flow or flow.mode not in ("search", "barcode"):
+                return
+            if flow.mode == "barcode":
+                await _save_barcode(message, flow, text)
                 return
             await _search(message, flow, text)
         finally:
